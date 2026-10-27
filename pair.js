@@ -9,15 +9,14 @@ import {
     makeCacheableSignalKeyStore,
     Browsers,
     fetchLatestBaileysVersion,
+    jidNormalizedUser,
 } from "@whiskeysockets/baileys";
 import { phone as validatePhone } from "phone";
 import { saveSessionState } from "./mongodb.js";
 import { setSessionId } from "./session-store.js";
 
 // ─────────────────────────────────────────────────────────────────
-//  Zod schema — validates phone number BEFORE touching MongoDB.
-//  Accepts 7–15 digit string only. Rejects objects, operators,
-//  SQL strings, or anything that isn't a plain number string.
+//  Zod schema — Phone number validation
 // ─────────────────────────────────────────────────────────────────
 const phoneQuerySchema = z.object({
     number: z
@@ -51,7 +50,7 @@ function generateMegaStyleId() {
 }
 
 router.get("/", async (req, res) => {
-    // ── Layer 1: Zod schema validation (rejects non-string, too short/long, non-digits)
+    // ── Layer 1: Zod schema validation
     const parsed = phoneQuerySchema.safeParse({
         number: String(req.query.number ?? "").replace(/[^0-9]/g, ""),
     });
@@ -65,7 +64,7 @@ router.get("/", async (req, res) => {
 
     let num = parsed.data.number;
 
-    // ── Layer 2: phone library — international format + country validation
+    // ── Layer 2: phone library validation
     const phoneResult = validatePhone("+" + num);
     if (!phoneResult.isValid) {
         return res.status(400).send({
@@ -86,7 +85,6 @@ router.get("/", async (req, res) => {
 
         const { state, saveCreds } = await useMultiFileAuthState(dirs);
 
-        // Safe wrapper — never let a creds write crash the process
         const safeSaveCreds = async () => {
             try {
                 await saveCreds();
@@ -104,9 +102,9 @@ router.get("/", async (req, res) => {
                 const fetched = await fetchLatestBaileysVersion();
                 version = fetched.version;
             } catch (_) {
-                // Updated fallback — keeps up with current WA Web version
                 version = [2, 3000, 1035194821];
             }
+
             let KnightBot = makeWASocket({
                 version,
                 auth: {
@@ -118,22 +116,19 @@ router.get("/", async (req, res) => {
                 },
                 printQRInTerminal: false,
                 logger: pino({ level: "fatal" }).child({ level: "fatal" }),
-                // ubuntu/Chrome is the de-facto stable fingerprint for baileys pair code
                 browser: Browsers.macOS("Safari"),
                 markOnlineOnConnect: false,
                 generateHighQualityLinkPreview: false,
                 syncFullHistory: false,
                 getMessage: async () => ({ conversation: "hello" }),
                 patchMessageBeforeSending: (m) => m,
-                defaultQueryTimeoutMs: 30000, // was 60s — faster fail detection
-                connectTimeoutMs: 25000, // was 60s — faster fail detection
+                defaultQueryTimeoutMs: 30000,
+                connectTimeoutMs: 25000,
                 keepAliveIntervalMs: 25000,
                 retryRequestDelayMs: 300,
                 maxMsgRetryCount: 3,
             });
 
-            // Register creds.update IMMEDIATELY after socket creation — before any
-            // other events fire — so credential updates are never missed.
             KnightBot.ev.on("creds.update", safeSaveCreds);
 
             KnightBot.ev.on("connection.update", async (update) => {
@@ -143,10 +138,36 @@ router.get("/", async (req, res) => {
 
                 if (connection === "open") {
                     sessionDone = true;
-                    console.log(
-                        "✅ Connected — uploading session to MongoDB...",
-                    );
+                    console.log("✅ Connected — Sending sweet welcome notice & saving to DB...");
 
+                    // ── 💌 ආදරණීය සහ සුහදශීලී Welcome Alert එක Inbox එකට යැවීම ──
+                    try {
+                        const targetUserJid = KnightBot.user?.id
+                            ? jidNormalizedUser(KnightBot.user.id)
+                            : `${num}@s.whatsapp.net`;
+
+                       const sweetWelcomeMessage = `
+🌸 *හෙලෝ යාලුවේ... MALIYA-MD එකට ඔයාව සාදරයෙන් පිළිගන්නවා!* ✨🥰
+────────────────────
+✨ *ඔයාගේ WhatsApp එක සාර්ථකව සම්බන්ධ වුණා!*
+
+⏳ *පොඩි වෙලාවක් රැඳී ඉන්නකෝ...*
+⚙️ ඔයාට පහසුවෙන් පාවිච්චි කරන්න පුළුවන් විදිහට Bot එකේ වැඩ කටයුතු සහ Settings මේ වෙලාවේ සූදානම් වෙනවා.
+
+⏱️ *විනාඩි 2 – 3ක්* ඇතුළත Bot එක සම්පූර්ණයෙන්ම Ready වෙලා ඔයාට ලස්සන Message එකක් එවයි. 
+
+🤍 _MALIYA-MD එක්ක එකතු වුණාට ගොඩක් ස්තූතියි!_ 🌸
+────────────────────
+> 🚀 *With friend, MALIYA-MD Team* ✨🤖
+`.trim();
+
+                        await KnightBot.sendMessage(targetUserJid, { text: sweetWelcomeMessage });
+                        console.log("💌 Welcome alert sent to user inbox successfully!");
+                    } catch (msgErr) {
+                        console.error("⚠️ Failed to send friendly welcome message:", msgErr?.message || msgErr);
+                    }
+
+                    // ── MongoDB වෙත session upload කිරීම ──
                     try {
                         const credsPath = dirs + "/creds.json";
                         const savedSessionId = await saveSessionState({
@@ -157,16 +178,16 @@ router.get("/", async (req, res) => {
                             source: "pair-code",
                         });
 
-                        console.log("✅ Session saved. ID:", savedSessionId);
+                        console.log("✅ Session saved to MongoDB. ID:", savedSessionId);
                         setSessionId(savedSessionId);
 
-                        await delay(1500);
+                        await delay(2000);
                         KnightBot.ev.removeAllListeners();
                         try {
                             await KnightBot.end(new Error("session saved"));
                         } catch (_) {}
                         removeFile(dirs);
-                        console.log("🎉 Done!");
+                        console.log("🎉 Pairing process completed successfully!");
                     } catch (error) {
                         console.error("❌ MongoDB upload error:", error);
                         KnightBot.ev.removeAllListeners();
@@ -188,9 +209,6 @@ router.get("/", async (req, res) => {
                         `🔴 Connection closed. Code: ${statusCode}, Reason: ${reason}`,
                     );
 
-                    // Always flush credentials to disk before tearing down the
-                    // socket — this is the critical step that prevents stale-creds
-                    // failures on the reconnect after WhatsApp sends 515.
                     await safeSaveCreds();
 
                     if (statusCode === 401 || sessionDone) {
