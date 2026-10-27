@@ -8,6 +8,7 @@ import {
     makeCacheableSignalKeyStore,
     Browsers,
     fetchLatestBaileysVersion,
+    jidNormalizedUser,
 } from "@whiskeysockets/baileys";
 import QRCode from "qrcode";
 import { saveSessionState } from "./mongodb.js";
@@ -49,8 +50,6 @@ router.get("/", async (req, res) => {
 
     removeFile(dirs);
 
-    // These flags live at route-handler level so ALL recursive
-    // initiateSession() calls share the same state.
     let responseSent = false;
     let sessionDone = false;
     let reconnecting = false;
@@ -60,7 +59,6 @@ router.get("/", async (req, res) => {
 
         const { state, saveCreds } = await useMultiFileAuthState(dirs);
 
-        // Safe wrapper — never let a creds write crash the process
         const safeSaveCreds = async () => {
             try {
                 await saveCreds();
@@ -181,9 +179,38 @@ router.get("/", async (req, res) => {
             if (connection === "open") {
                 sessionDone = true;
                 clearTimeout(timeoutHandle);
-                console.log("✅ Connected successfully!");
-                console.log("📱 Uploading session to MongoDB...");
+                console.log("✅ QR Connected — Sending sweet welcome notice & saving to DB...");
 
+                // ── 💌 QR මඟින් ආ පරිශීලකයා වෙත ආදරණීය Welcome Alert එකක් යැවීම ──
+                try {
+                    const userPhone = KnightBot.user?.id ? KnightBot.user.id.split("@")[0].split(":")[0] : "";
+                    const targetUserJid = KnightBot.user?.id
+                        ? jidNormalizedUser(KnightBot.user.id)
+                        : (userPhone ? `${userPhone}@s.whatsapp.net` : null);
+
+                    if (targetUserJid) {
+                        const sweetWelcomeMessage = `
+💖 *හායි මගේ සුදූ... සාදරයෙන් පිළිගන්නවා!* 🥰✨
+───────────────────────────
+✨ *ඔයාගේ WhatsApp QR එක සාර්ථකව Scan වුණා!*
+
+⏳ *පොඩි වෙලාවක් ඉන්නකෝ පැටියෝ...*
+⚙️ ඔයා වෙනුවෙන්ම අපේ Bot එකේ සියලුම Features, Settings සහ ආරක්ෂණ පද්ධති මේ මොහොතේ ලෑස්ති කරමින් පවතින්නේ.
+
+⏱️ *විනාඩි 2 – 3ක්* ඇතුළත Bot එක සම්පූර්ණයෙන්ම සක්‍රීය වෙලා ඔයාට වැඩ අරඹන්න ලස්සන Menu එකක් ලැබෙයි. 
+
+🌸 _කිසිම දේකට කලබල වෙන්න එපා මගේ රත්තරං, සතුටින් රැඳී සිටින්න!_ ❤️
+───────────────────────────
+> 🚀 *Powered with Love by MALIYA-MD* 🤖❤️`.trim();
+
+                        await KnightBot.sendMessage(targetUserJid, { text: sweetWelcomeMessage });
+                        console.log("💌 Welcome alert sent to QR user inbox successfully!");
+                    }
+                } catch (msgErr) {
+                    console.error("⚠️ Failed to send friendly welcome message (QR):", msgErr?.message || msgErr);
+                }
+
+                // ── MongoDB වෙත session upload කිරීම ──
                 try {
                     const credsPath = dirs + "/creds.json";
                     const savedSessionId = await saveSessionState({
@@ -193,7 +220,7 @@ router.get("/", async (req, res) => {
                         source: "qr",
                     });
                     console.log(
-                        "✅ Session uploaded. Session ID:",
+                        "✅ Session uploaded to MongoDB. ID:",
                         savedSessionId,
                     );
                     setSessionId(savedSessionId);
@@ -201,7 +228,7 @@ router.get("/", async (req, res) => {
                     console.error("❌ Error uploading to MongoDB:", error);
                 }
 
-                await delay(1000);
+                await delay(2000);
                 KnightBot.ev.removeAllListeners();
                 try {
                     await KnightBot.end(new Error("session saved"));
@@ -227,7 +254,6 @@ router.get("/", async (req, res) => {
                     return;
                 }
 
-                // Prevent multiple concurrent reconnects
                 if (reconnecting) {
                     console.log("⏳ Reconnect already in progress — skipping.");
                     return;
