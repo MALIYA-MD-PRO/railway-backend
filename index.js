@@ -8,6 +8,7 @@ import cors       from "cors";
 import jwt        from "jsonwebtoken";
 import { fileURLToPath } from "url";
 import path       from "path";
+import fs         from "fs";
 import http       from "http";
 import rateLimit  from "express-rate-limit";
 import { createRequire } from "module";
@@ -61,7 +62,7 @@ app.use(helmet({
 // ─────────────────────────────────────────────────────────────────
 //  LAYER 02 — CORS
 // ─────────────────────────────────────────────────────────────────
-const _FRONTEND_URL = process.env.FRONTEND_URL || "";
+const _FRONTEND_URL = process.env.FRONTEND_URL || "https://maliya-md.vercel.app";
 delete process.env.FRONTEND_URL;
 
 app.use(cors({
@@ -203,17 +204,28 @@ app.use((req, _res, next) => {
 });
 
 // ─────────────────────────────────────────────────────────────────
-//  Static files + Multi-Page Routes (index, pair, settings, react)
+//  Static files + Multi-Page Routes (Safe when HTML is on Vercel)
 // ─────────────────────────────────────────────────────────────────
 app.use(express.static(__dirname, { index: false }));
 
 function sendHtmlPage(res, fileName) {
+  const filePath = path.join(__dirname, fileName);
+  if (!fs.existsSync(filePath)) {
+    const cleanTarget = fileName === "index.html" ? "" : `/${fileName}`;
+    return res.redirect(302, `${_FRONTEND_URL.replace(/\/$/, "")}${cleanTarget}`);
+  }
   res.set({ "Cache-Control": "no-store, no-cache, must-revalidate", Pragma: "no-cache" });
-  res.sendFile(path.join(__dirname, fileName));
+  return res.sendFile(filePath);
 }
 
 app.get(["/", "/index.html"], (_req, res) => sendHtmlPage(res, "index.html"));
-app.get(["/pair", "/pair.html"], (_req, res) => sendHtmlPage(res, "pair.html"));
+
+// ✅ If ?number= is passed, pass to pairRouter API; otherwise serve/redirect pair.html
+app.get(["/pair", "/pair.html"], (req, res, next) => {
+  if (req.query.number !== undefined) return next();
+  return sendHtmlPage(res, "pair.html");
+});
+
 app.get(["/settings", "/settings.html"], (_req, res) => sendHtmlPage(res, "settings.html"));
 app.get(["/react", "/react.html"], (_req, res) => sendHtmlPage(res, "react.html"));
 
