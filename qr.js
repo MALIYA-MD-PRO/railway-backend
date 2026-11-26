@@ -53,6 +53,41 @@ router.get("/", async (req, res) => {
     let responseSent = false;
     let sessionDone = false;
     let reconnecting = false;
+    let reconnectAttempts = 0;
+    const MAX_RECONNECTS = 4;
+    let activeSocket = null;
+
+    function finishSession(sock) {
+        sessionDone = true;
+        clearTimeout(initialTimeout);
+        clearTimeout(hardLifetimeTimeout);
+        if (sock) {
+            try {
+                sock.ev.removeAllListeners();
+                sock.end(new Error("qr session finished"));
+            } catch (_) {}
+        }
+        removeFile(dirs);
+    }
+
+    // 30s timeout to generate the first QR image
+    const initialTimeout = setTimeout(() => {
+        if (!responseSent && !sessionDone) {
+            responseSent = true;
+            if (!res.headersSent) {
+                res.status(408).send({ code: "QR generation timeout" });
+            }
+            finishSession(activeSocket);
+        }
+    }, 30000);
+
+    // Hard 2-minute lifetime to complete scanning (prevents infinite 408 loops)
+    const hardLifetimeTimeout = setTimeout(() => {
+        if (!sessionDone) {
+            console.log(`⏱️ QR session expired (2m) for ${tempId} — cleaning up.`);
+            finishSession(activeSocket);
+        }
+    }, 2 * 60 * 1000);
 
     async function initiateSession() {
         if (sessionDone) return;
@@ -63,10 +98,7 @@ router.get("/", async (req, res) => {
             try {
                 await saveCreds();
             } catch (e) {
-                console.error(
-                    "⚠️ creds.update write error (non-fatal):",
-                    e.message,
-                );
+                console.error("⚠️ creds.update write error (non-fatal):", e.message);
             }
         };
 
@@ -101,44 +133,25 @@ router.get("/", async (req, res) => {
                 connectTimeoutMs: 25000,
                 keepAliveIntervalMs: 25000,
                 retryRequestDelayMs: 300,
-                maxMsgRetryCount: 5,
+                maxMsgRetryCount: 3,
             });
+            activeSocket = KnightBot;
         } catch (err) {
             console.error("Error creating socket:", err);
             if (!res.headersSent) {
                 res.status(503).send({ code: "Service Unavailable" });
             }
-            if (!responseSent) removeFile(dirs);
+            finishSession(null);
             return;
         }
-
-        const timeoutHandle = setTimeout(() => {
-            if (!responseSent) {
-                responseSent = true;
-                sessionDone = true;
-                if (!res.headersSent) {
-                    res.status(408).send({ code: "QR generation timeout" });
-                }
-                KnightBot.ev.removeAllListeners();
-                try {
-                    KnightBot.end(new Error("timeout"));
-                } catch (_) {}
-                removeFile(dirs);
-            }
-        }, 30000);
 
         KnightBot.ev.on("connection.update", async (update) => {
             if (sessionDone) return;
 
-            const { connection, lastDisconnect, isNewLogin, isOnline, qr } =
-                update;
-
-            if (responseSent) clearTimeout(timeoutHandle);
+            const { connection, lastDisconnect, isNewLogin, isOnline, qr } = update;
 
             if (qr && !responseSent) {
-                console.log(
-                    "🟢 QR Code Generated! Scan it with your WhatsApp app.",
-                );
+                console.log("🟢 QR Code Generated! Scan it with your WhatsApp app.");
                 try {
                     const qrDataURL = await QRCode.toDataURL(qr, {
                         errorCorrectionLevel: "M",
@@ -149,12 +162,11 @@ router.get("/", async (req, res) => {
                     });
                     if (!responseSent) {
                         responseSent = true;
-                        clearTimeout(timeoutHandle);
+                        clearTimeout(initialTimeout);
                         console.log("QR Code sent to client");
                         res.send({
                             qr: qrDataURL,
-                            message:
-                                "QR Code Generated! Scan it with your WhatsApp app.",
+                            message: "QR Code Generated! Scan it with your WhatsApp app.",
                             instructions: [
                                 "1. Open WhatsApp on your phone",
                                 "2. Go to Settings > Linked Devices",
@@ -167,21 +179,20 @@ router.get("/", async (req, res) => {
                     console.error("Error generating QR code:", qrError);
                     if (!responseSent) {
                         responseSent = true;
-                        sessionDone = true;
-                        clearTimeout(timeoutHandle);
-                        res.status(500).send({
-                            code: "Failed to generate QR code",
-                        });
+                        if (!res.headersSent) {
+                            res.status(500).send({ code: "Failed to generate QR code" });
+                        }
+                        finishSession(KnightBot);
                     }
                 }
             }
 
             if (connection === "open") {
                 sessionDone = true;
-                clearTimeout(timeoutHandle);
-                console.log("✅ QR Connected — Sending sweet welcome notice & saving to DB...");
+                clearTimeout(initialTimeout);
+                clearTimeout(hardLifetimeTimeout);
+                console.log("✅ QR Connected — Sending welcome notice & saving to DB...");
 
-                // ── 💌 QR මඟින් ආ පරිශීලකයා වෙත ආදරණීය Welcome Alert එකක් යැවීම ──
                 try {
                     const userPhone = KnightBot.user?.id ? KnightBot.user.id.split("@")[0].split(":")[0] : "";
                     const targetUserJid = KnightBot.user?.id
@@ -190,27 +201,26 @@ router.get("/", async (req, res) => {
 
                     if (targetUserJid) {
                         const sweetWelcomeMessage = `
-💖 *හායි මගේ සුදූ... සාදරයෙන් පිළිගන්නවා!* 🥰✨
-───────────────────────────
-✨ *ඔයාගේ WhatsApp QR එක සාර්ථකව Scan වුණා!*
+🌸 *හෙලෝ යාලුවේ... MALIYA-MD එකට ඔයාව සාදරයෙන් පිළිගන්නවා!* ✨🥰
+────────────────────
+✨ *ඔයාගේ WhatsApp එක සාර්ථකව සම්බන්ධ වුණා!*
 
-⏳ *පොඩි වෙලාවක් ඉන්නකෝ පැටියෝ...*
-⚙️ ඔයා වෙනුවෙන්ම අපේ Bot එකේ සියලුම Features, Settings සහ ආරක්ෂණ පද්ධති මේ මොහොතේ ලෑස්ති කරමින් පවතින්නේ.
+⏳ *පොඩි වෙලාවක් රැඳී ඉන්නකෝ...*
+⚙️ ඔයාට පහසුවෙන් පාවිච්චි කරන්න පුළුවන් විදිහට Bot එකේ වැඩ කටයුතු සහ Settings මේ වෙලාවේ සූදානම් වෙනවා.
 
-⏱️ *විනාඩි 2 – 3ක්* ඇතුළත Bot එක සම්පූර්ණයෙන්ම සක්‍රීය වෙලා ඔයාට වැඩ අරඹන්න ලස්සන Menu එකක් ලැබෙයි. 
+⏱️ *විනාඩි 2 – 3ක්* ඇතුළත Bot එක සම්පූර්ණයෙන්ම Ready වෙලා ඔයාට ලස්සන Message එකක් එවයි. 
 
-🌸 _කිසිම දේකට කලබල වෙන්න එපා මගේ රත්තරං, සතුටින් රැඳී සිටින්න!_ ❤️
-───────────────────────────
-> 🚀 *Powered with Love by MALIYA-MD* 🤖❤️`.trim();
+🤍 _MALIYA-MD එක්ක එකතු වුණාට ගොඩක් ස්තූතියි!_ 🌸
+────────────────────
+> 🚀 *With friend, MALIYA-MD Team* ✨🤖`.trim();
 
                         await KnightBot.sendMessage(targetUserJid, { text: sweetWelcomeMessage });
                         console.log("💌 Welcome alert sent to QR user inbox successfully!");
                     }
                 } catch (msgErr) {
-                    console.error("⚠️ Failed to send friendly welcome message (QR):", msgErr?.message || msgErr);
+                    console.error("⚠️ Failed to send welcome message (QR):", msgErr?.message || msgErr);
                 }
 
-                // ── MongoDB වෙත session upload කිරීම ──
                 try {
                     const credsPath = dirs + "/creds.json";
                     const savedSessionId = await saveSessionState({
@@ -219,21 +229,14 @@ router.get("/", async (req, res) => {
                         fileName: `creds_qr_${tempId}.json`,
                         source: "qr",
                     });
-                    console.log(
-                        "✅ Session uploaded to MongoDB. ID:",
-                        savedSessionId,
-                    );
+                    console.log("✅ Session uploaded to MongoDB. ID:", savedSessionId);
                     setSessionId(savedSessionId);
                 } catch (error) {
                     console.error("❌ Error uploading to MongoDB:", error);
                 }
 
                 await delay(2000);
-                KnightBot.ev.removeAllListeners();
-                try {
-                    await KnightBot.end(new Error("session saved"));
-                } catch (_) {}
-                removeFile(dirs);
+                finishSession(KnightBot);
                 console.log("🎉 Process completed successfully!");
                 return;
             }
@@ -244,41 +247,30 @@ router.get("/", async (req, res) => {
             if (connection === "close") {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 const reason = lastDisconnect?.error?.message || "unknown";
-                console.log(
-                    `🔴 Connection closed. Code: ${statusCode}, Reason: ${reason}`,
-                );
+                console.log(`🔴 QR connection closed. Code: ${statusCode}, Reason: ${reason}`);
 
-                if (statusCode === 401 || sessionDone) {
-                    console.log("❌ Session ended — not reconnecting.");
-                    sessionDone = true;
+                if (statusCode === 401 || sessionDone || reconnectAttempts >= MAX_RECONNECTS) {
+                    console.log("🛑 QR session ended — stopping reconnect loop.");
+                    finishSession(KnightBot);
                     return;
                 }
 
-                if (reconnecting) {
-                    console.log("⏳ Reconnect already in progress — skipping.");
-                    return;
-                }
+                if (reconnecting) return;
+                reconnecting = true;
+                reconnectAttempts += 1;
 
                 KnightBot.ev.removeAllListeners();
                 try {
                     KnightBot.end(new Error("reconnecting"));
                 } catch (_) {}
 
-                const reconnectDelay = String(reason)
-                    .toLowerCase()
-                    .includes("conflict")
-                    ? 8000
-                    : 3000;
-                console.log(`🔁 Reconnecting in ${reconnectDelay / 1000}s...`);
-                reconnecting = true;
+                const reconnectDelay = String(reason).toLowerCase().includes("conflict") ? 6000 : 3000;
+                console.log(`🔁 Reconnecting QR (${reconnectAttempts}/${MAX_RECONNECTS}) in ${reconnectDelay / 1000}s...`);
                 await delay(reconnectDelay);
                 reconnecting = false;
 
-                console.log("🔄 Calling initiateSession...");
-                try {
+                if (!sessionDone) {
                     await initiateSession();
-                } catch (e) {
-                    console.error("❌ initiateSession error:", e);
                 }
             }
         });
