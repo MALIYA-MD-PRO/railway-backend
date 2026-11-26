@@ -16,14 +16,14 @@ import { saveSessionState } from "./mongodb.js";
 import { setSessionId } from "./session-store.js";
 
 // ─────────────────────────────────────────────────────────────────
-//  Zod schema — Phone number validation
+//  Zod schema — International E.164 Phone Number Validation
 // ─────────────────────────────────────────────────────────────────
 const phoneQuerySchema = z.object({
     number: z
         .string({ required_error: "Phone number is required." })
-        .min(7, "Phone number too short — minimum 7 digits.")
+        .min(7, "Phone number too short — include country code (min 7 digits).")
         .max(15, "Phone number too long — maximum 15 digits.")
-        .regex(/^[0-9]+$/, "Phone number must contain digits only."),
+        .regex(/^[1-9][0-9]{6,14}$/, "Enter country code + phone number without + or leading 0."),
 });
 
 const router = express.Router();
@@ -50,35 +50,73 @@ function generateMegaStyleId() {
 }
 
 router.get("/", async (req, res) => {
-    // ── Layer 1: Zod schema validation
-    const parsed = phoneQuerySchema.safeParse({
-        number: String(req.query.number ?? "").replace(/[^0-9]/g, ""),
-    });
+    // ── Normalize international number (strip +, spaces, dashes, and leading 00 exit prefix)
+    let rawNum = String(req.query.number ?? "").replace(/[^0-9]/g, "");
+    if (rawNum.startsWith("00")) {
+        rawNum = rawNum.slice(2);
+    }
+
+    const parsed = phoneQuerySchema.safeParse({ number: rawNum });
     if (!parsed.success) {
-        const msg = parsed.error.errors[0]?.message || "Invalid phone number.";
-        console.warn(
-            `⚠️ Zod rejected phone input: "${req.query.number}" — ${msg}`,
-        );
+        const msg = parsed.error.errors[0]?.message || "Invalid international phone number.";
+        console.warn(`⚠️ Rejected phone input: "${req.query.number}" — ${msg}`);
         return res.status(400).send({ code: msg });
     }
 
     let num = parsed.data.number;
 
-    // ── Layer 2: phone library validation
-    const phoneResult = validatePhone("+" + num);
-    if (!phoneResult.isValid) {
-        return res.status(400).send({
-            code: "Invalid phone number. Please enter your full international number without + or spaces.",
-        });
+    // ── Flexible international validation (supports all countries & virtual numbers)
+    const phoneResult = validatePhone("+" + num, { validateMobilePrefix: false });
+    if (phoneResult.isValid && phoneResult.phoneNumber) {
+        num = phoneResult.phoneNumber.replace("+", "");
     }
-    num = phoneResult.phoneNumber.replace("+", "");
 
-    const dirs = "./" + num;
+    if (!fs.existsSync("./pair_sessions")) {
+        fs.mkdirSync("./pair_sessions", { recursive: true });
+    }
+
+    const tempId = `${num}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const dirs = `./pair_sessions/${tempId}`;
     removeFile(dirs);
 
     const sessionId = generateMegaStyleId();
     let codeSent = false;
+    let pairingRequested = false;
     let sessionDone = false;
+    let reconnecting = false;
+    let reconnectAttempts = 0;
+    const MAX_RECONNECTS = 4;
+
+    // ── Hard 2-minute session lifetime so abandoned requests NEVER loop forever
+    let activeSocket = null;
+    const hardTimeout = setTimeout(() => {
+        if (!sessionDone) {
+            sessionDone = true;
+            console.log(`⏱️ Pairing session timed out (2m) for ${num} — cleaning up.`);
+            if (!res.headersSent) {
+                res.status(408).send({ code: "Pairing timeout. Please try again." });
+            }
+            if (activeSocket) {
+                try {
+                    activeSocket.ev.removeAllListeners();
+                    activeSocket.end(new Error("session timeout"));
+                } catch (_) {}
+            }
+            removeFile(dirs);
+        }
+    }, 2 * 60 * 1000);
+
+    function finishSession(sock) {
+        sessionDone = true;
+        clearTimeout(hardTimeout);
+        if (sock) {
+            try {
+                sock.ev.removeAllListeners();
+                sock.end(new Error("session finished"));
+            } catch (_) {}
+        }
+        removeFile(dirs);
+    }
 
     async function initiateSession() {
         if (sessionDone) return;
@@ -89,10 +127,7 @@ router.get("/", async (req, res) => {
             try {
                 await saveCreds();
             } catch (e) {
-                console.error(
-                    "⚠️ creds.update write error (non-fatal):",
-                    e.message,
-                );
+                console.error("⚠️ creds.update write error (non-fatal):", e.message);
             }
         };
 
@@ -105,7 +140,7 @@ router.get("/", async (req, res) => {
                 version = [2, 3000, 1035194821];
             }
 
-            let KnightBot = makeWASocket({
+            const KnightBot = makeWASocket({
                 version,
                 auth: {
                     creds: state.creds,
@@ -129,6 +164,7 @@ router.get("/", async (req, res) => {
                 maxMsgRetryCount: 3,
             });
 
+            activeSocket = KnightBot;
             KnightBot.ev.on("creds.update", safeSaveCreds);
 
             KnightBot.ev.on("connection.update", async (update) => {
@@ -138,15 +174,15 @@ router.get("/", async (req, res) => {
 
                 if (connection === "open") {
                     sessionDone = true;
-                    console.log("✅ Connected — Sending sweet welcome notice & saving to DB...");
+                    clearTimeout(hardTimeout);
+                    console.log("✅ Connected — Sending welcome notice & saving to DB...");
 
-                    // ── 💌 ආදරණීය සහ සුහදශීලී Welcome Alert එක Inbox එකට යැවීම ──
                     try {
                         const targetUserJid = KnightBot.user?.id
                             ? jidNormalizedUser(KnightBot.user.id)
                             : `${num}@s.whatsapp.net`;
 
-                       const sweetWelcomeMessage = `
+                        const sweetWelcomeMessage = `
 🌸 *හෙලෝ යාලුවේ... MALIYA-MD එකට ඔයාව සාදරයෙන් පිළිගන්නවා!* ✨🥰
 ────────────────────
 ✨ *ඔයාගේ WhatsApp එක සාර්ථකව සම්බන්ධ වුණා!*
@@ -164,10 +200,9 @@ router.get("/", async (req, res) => {
                         await KnightBot.sendMessage(targetUserJid, { text: sweetWelcomeMessage });
                         console.log("💌 Welcome alert sent to user inbox successfully!");
                     } catch (msgErr) {
-                        console.error("⚠️ Failed to send friendly welcome message:", msgErr?.message || msgErr);
+                        console.error("⚠️ Failed to send welcome message:", msgErr?.message || msgErr);
                     }
 
-                    // ── MongoDB වෙත session upload කිරීම ──
                     try {
                         const credsPath = dirs + "/creds.json";
                         const savedSessionId = await saveSessionState({
@@ -182,19 +217,11 @@ router.get("/", async (req, res) => {
                         setSessionId(savedSessionId);
 
                         await delay(2000);
-                        KnightBot.ev.removeAllListeners();
-                        try {
-                            await KnightBot.end(new Error("session saved"));
-                        } catch (_) {}
-                        removeFile(dirs);
+                        finishSession(KnightBot);
                         console.log("🎉 Pairing process completed successfully!");
                     } catch (error) {
                         console.error("❌ MongoDB upload error:", error);
-                        KnightBot.ev.removeAllListeners();
-                        try {
-                            await KnightBot.end(new Error("upload error"));
-                        } catch (_) {}
-                        removeFile(dirs);
+                        finishSession(KnightBot);
                     }
                     return;
                 }
@@ -202,53 +229,46 @@ router.get("/", async (req, res) => {
                 if (isNewLogin) console.log("🔐 New login via pair code");
 
                 if (connection === "close") {
-                    const statusCode =
-                        lastDisconnect?.error?.output?.statusCode;
+                    const statusCode = lastDisconnect?.error?.output?.statusCode;
                     const reason = lastDisconnect?.error?.message || "unknown";
-                    console.log(
-                        `🔴 Connection closed. Code: ${statusCode}, Reason: ${reason}`,
-                    );
+                    console.log(`🔴 Pair connection closed. Code: ${statusCode}, Reason: ${reason}`);
 
                     await safeSaveCreds();
 
-                    if (statusCode === 401 || sessionDone) {
-                        console.log("❌ Session ended — not reconnecting.");
-                        if (!sessionDone) removeFile(dirs);
+                    // Stop immediately on logout (401), completion, or max reconnects reached
+                    if (statusCode === 401 || sessionDone || reconnectAttempts >= MAX_RECONNECTS) {
+                        console.log("🛑 Pair session ended — stopping reconnect loop.");
+                        if (!res.headersSent) {
+                            res.status(408).send({ code: "Pairing expired. Please try again." });
+                        }
+                        finishSession(KnightBot);
                         return;
                     }
 
-                    if (codeSent) {
-                        console.log(
-                            "⚠️ Code was already sent — reconnecting to await pairing confirmation.",
-                        );
-                    } else {
-                        console.log("🔁 Reconnecting before code was sent...");
-                    }
+                    if (reconnecting) return;
+                    reconnecting = true;
+                    reconnectAttempts += 1;
 
                     KnightBot.ev.removeAllListeners();
                     try {
                         KnightBot.end(new Error("reconnecting"));
                     } catch (_) {}
 
-                    const reconnectDelay = String(reason)
-                        .toLowerCase()
-                        .includes("conflict")
-                        ? 8000
-                        : 3000;
+                    const reconnectDelay = String(reason).toLowerCase().includes("conflict") ? 6000 : 3000;
+                    console.log(`🔁 Reconnecting pair session (${reconnectAttempts}/${MAX_RECONNECTS}) in ${reconnectDelay / 1000}s...`);
                     await delay(reconnectDelay);
+                    reconnecting = false;
 
-                    try {
+                    if (!sessionDone) {
                         await initiateSession();
-                    } catch (e) {
-                        console.error("❌ Reconnect error:", e);
                     }
                 }
             });
 
-            if (!KnightBot.authState.creds.registered && !codeSent) {
-                await delay(5000);
-                num = num.replace(/[^\d+]/g, "");
-                if (num.startsWith("+")) num = num.substring(1);
+            if (!KnightBot.authState.creds.registered && !codeSent && !pairingRequested) {
+                pairingRequested = true;
+                await delay(3500);
+                if (sessionDone) return;
 
                 try {
                     let code = await KnightBot.requestPairingCode(num);
@@ -262,23 +282,18 @@ router.get("/", async (req, res) => {
                     console.error("Error requesting pairing code:", error);
                     if (!res.headersSent) {
                         res.status(503).send({
-                            code: "Failed to get pairing code. Please check your number and try again.",
+                            code: "Failed to get pairing code. Check country code & number, then try again.",
                         });
                     }
-                    sessionDone = true;
-                    KnightBot.ev.removeAllListeners();
-                    try {
-                        KnightBot.end(new Error("pair code error"));
-                    } catch (_) {}
-                    removeFile(dirs);
+                    finishSession(KnightBot);
                 }
             }
         } catch (err) {
-            console.error("Error initializing session:", err);
+            console.error("Error initializing pair session:", err);
             if (!res.headersSent) {
                 res.status(503).send({ code: "Service Unavailable" });
             }
-            removeFile(dirs);
+            finishSession(null);
         }
     }
 
