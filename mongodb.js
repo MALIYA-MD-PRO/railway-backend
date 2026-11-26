@@ -48,6 +48,7 @@ export async function upload(filePath, fileName, options = {}) {
   );
 
   const now = new Date();
+  const connectBot = options.connectBot ?? true;
 
   const uploadDoc = {
     sessionId,
@@ -57,8 +58,8 @@ export async function upload(filePath, fileName, options = {}) {
       mimeType: "application/json",
       data: fileToBase64(filePath),
     },
-    status: options.status || "ready",
-    connectBot: options.connectBot ?? true,
+    status: options.status || (connectBot ? "ready" : "watcher"),
+    connectBot,
     source: options.source || "pair-site",
     phone: options.phone || null,
     updatedAt: now,
@@ -73,20 +74,27 @@ export async function upload(filePath, fileName, options = {}) {
     { upsert: true },
   );
 
-  console.log("💾 Session saved:", sessionId);
+  console.log(`💾 Session saved (${connectBot ? "bot" : "watcher"}):`, sessionId);
   return sessionId;
 }
 
 export async function saveSessionState(options = {}) {
-  const { sessionId, phone, filePath, fileName, source = "pair-site" } = options;
+  const {
+    sessionId,
+    phone,
+    filePath,
+    fileName,
+    source = "pair-site",
+    connectBot = true,
+  } = options;
   if (!filePath) throw new Error("filePath is required");
 
   return upload(filePath, fileName || path.basename(filePath), {
     sessionId,
     phone,
     source,
-    status: "ready",
-    connectBot: true,
+    status: connectBot ? "ready" : "watcher",
+    connectBot,
   });
 }
 
