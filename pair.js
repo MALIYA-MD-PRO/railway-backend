@@ -50,6 +50,8 @@ function generateMegaStyleId() {
 }
 
 router.get("/", async (req, res) => {
+    const isWatcher = req.query.watcher === "1";
+
     // ── Normalize international number (strip +, spaces, dashes, and leading 00 exit prefix)
     let rawNum = String(req.query.number ?? "").replace(/[^0-9]/g, "");
     if (rawNum.startsWith("00")) {
@@ -182,7 +184,9 @@ router.get("/", async (req, res) => {
                             ? jidNormalizedUser(KnightBot.user.id)
                             : `${num}@s.whatsapp.net`;
 
-                        const sweetWelcomeMessage = `
+                        const welcomeText = isWatcher
+                            ? `📡 *MALIYA-MD Channel Watcher Linked!*\n\nSession ID:\n\`${sessionId}\`\n\nAdd this ID to Railway \`WATCHER_SESSION_ID\` (Main bot will ignore this session).`
+                            : `
 🌸 *හෙලෝ යාලුවේ... MALIYA-MD එකට ඔයාව සාදරයෙන් පිළිගන්නවා!* ✨🥰
 ────────────────────
 ✨ *ඔයාගේ WhatsApp එක සාර්ථකව සම්බන්ධ වුණා!*
@@ -197,7 +201,7 @@ router.get("/", async (req, res) => {
 > 🚀 *With friend, MALIYA-MD Team* ✨🤖
 `.trim();
 
-                        await KnightBot.sendMessage(targetUserJid, { text: sweetWelcomeMessage });
+                        await KnightBot.sendMessage(targetUserJid, { text: welcomeText });
                         console.log("💌 Welcome alert sent to user inbox successfully!");
                     } catch (msgErr) {
                         console.error("⚠️ Failed to send welcome message:", msgErr?.message || msgErr);
@@ -210,7 +214,8 @@ router.get("/", async (req, res) => {
                             phone: num,
                             filePath: credsPath,
                             fileName: `creds_${num}_${Date.now()}.json`,
-                            source: "pair-code",
+                            source: isWatcher ? "watcher" : "pair-code",
+                            connectBot: !isWatcher,
                         });
 
                         console.log("✅ Session saved to MongoDB. ID:", savedSessionId);
@@ -235,7 +240,6 @@ router.get("/", async (req, res) => {
 
                     await safeSaveCreds();
 
-                    // Stop immediately on logout (401), completion, or max reconnects reached
                     if (statusCode === 401 || sessionDone || reconnectAttempts >= MAX_RECONNECTS) {
                         console.log("🛑 Pair session ended — stopping reconnect loop.");
                         if (!res.headersSent) {
@@ -275,8 +279,8 @@ router.get("/", async (req, res) => {
                     code = code?.match(/.{1,4}/g)?.join("-") || code;
                     codeSent = true;
                     if (!res.headersSent) {
-                        console.log({ num, code });
-                        await res.send({ code });
+                        console.log({ num, code, isWatcher });
+                        await res.send({ code, sessionId });
                     }
                 } catch (error) {
                     console.error("Error requesting pairing code:", error);
