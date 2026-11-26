@@ -26,9 +26,9 @@ const BOOSTED_POSTS_COLLECTION = "boosted_channel_posts";
 const CHANNEL_POST_RE = /^https?:\/\/(www\.)?whatsapp\.com\/channel\/([A-Za-z0-9_-]{10,45})\/(\d{1,12})\/?$/;
 const CHANNEL_ONLY_RE = /^https?:\/\/(www\.)?whatsapp\.com\/channel\/([A-Za-z0-9_-]{10,45})\/?$/;
 
-// In-memory locks
 const inFlightPosts = new Set();
 let isCycleRunning = false;
+let watcherInitialized = false;
 
 function getApiKey() {
   return CACHED_WPRH_KEY || process.env.WPRH_API_KEY || "";
@@ -40,8 +40,8 @@ function getWatcherSessionId() {
 
 // ── Random Sleep Delay Helper: Strictly between 2 mins and 6.5 mins (< 7 mins) ──
 function getRandomSleepMs() {
-  const MIN_MS = 2 * 60 * 1000;       // 2 minutes (120,000 ms)
-  const MAX_MS = 6.5 * 60 * 1000;     // 6.5 minutes (390,000 ms) — always < 7 mins
+  const MIN_MS = 2 * 60 * 1000;       // 2.0 minutes
+  const MAX_MS = 6.5 * 60 * 1000;     // 6.5 minutes (always < 7 mins)
   return Math.floor(MIN_MS + Math.random() * (MAX_MS - MIN_MS));
 }
 
@@ -74,7 +74,6 @@ async function getReactDb() {
   _db = client.db(getMongoDb());
 
   await _db.collection(WEEKLY_COLLECTION).createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
-  // Hard database-level guarantee: a post can ONLY ever be boosted ONCE
   await _db.collection(BOOSTED_POSTS_COLLECTION).createIndex(
     { inviteCode: 1, postId: 1 },
     { unique: true }
@@ -160,7 +159,6 @@ async function boostDetectedPost(sub, postId) {
     const boostedCol = db.collection(BOOSTED_POSTS_COLLECTION);
     const subsCol = db.collection(WEEKLY_COLLECTION);
 
-    // 1. Atomic unique insert: if this postId was EVER boosted before, throws E11000 and stops
     try {
       await boostedCol.insertOne({
         inviteCode: sub.inviteCode,
@@ -176,7 +174,6 @@ async function boostDetectedPost(sub, postId) {
       throw dupErr;
     }
 
-    // 2. Dispatch reactions to the exact post link
     const postUrl = `https://whatsapp.com/channel/${sub.inviteCode}/${numericId}`;
     try {
       await dispatchPremiumReact(postUrl, sub.count, sub.emojis);
@@ -201,7 +198,7 @@ async function boostDetectedPost(sub, postId) {
   }
 }
 
-// ── Multi-UA Public Channel Scraper (Fallback / Title Fetch) ─────
+// ── Multi-Pattern Public Channel HTML & JSON Post Extractor ───────
 async function fetchChannelInfoAndPosts(inviteCode) {
   let title = "WhatsApp Channel";
   const ids = new Set();
@@ -231,7 +228,8 @@ async function fetchChannelInfoAndPosts(inviteCode) {
       const patterns = [
         new RegExp(`whatsapp\\.com/channel/${inviteCode}/(\\d{1,12})`, "g"),
         new RegExp(`whatsapp\\.com\\\\/channel\\\\/${inviteCode}\\\\/(\\d{1,12})`, "g"),
-        /"(?:server_id|newsletter_server_id|message_server_id)"\s*:\s*"?(\d{1,12})"?/g,
+        /"(?:server_id|newsletter_server_id|message_server_id|post_id)"\s*:\s*"?(\d{1,12})"?/g,
+        /data-(?:post|message|msg)-id=["'](\d{1,12})["']/gi,
       ];
 
       for (const re of patterns) {
@@ -252,8 +250,6 @@ async function fetchChannelInfoAndPosts(inviteCode) {
 // ═════════════════════════════════════════════════════════════════
 //  WAKE -> CHECK CHANNELS -> REACT -> SLEEP (Human-Like Burst Cycle)
 // ═════════════════════════════════════════════════════════════════
-let watcherInitialized = false;
-
 async function runWakeCheckSleepCycle() {
   if (isCycleRunning) return;
   isCycleRunning = true;
@@ -267,7 +263,6 @@ async function runWakeCheckSleepCycle() {
       .find({ active: true, expiresAt: { $gt: new Date() } })
       .toArray();
 
-    // If no active weekly subscriptions exist, stay asleep without connecting
     if (activeSubs.length === 0) {
       return;
     }
@@ -276,6 +271,7 @@ async function runWakeCheckSleepCycle() {
 
     const sid = getWatcherSessionId();
     const watcherDir = "./watcher_session";
+    const detectedByJid = new Map();
 
     if (sid) {
       if (!watcherInitialized || !fs.existsSync(path.join(watcherDir, "creds.json"))) {
@@ -294,28 +290,64 @@ async function runWakeCheckSleepCycle() {
         browser: Browsers.macOS("Safari"),
         markOnlineOnConnect: false,
         syncFullHistory: false,
-        connectTimeoutMs: 20000,
+        connectTimeoutMs: 30000,
+        defaultQueryTimeoutMs: 30000,
       });
 
       sock.ev.on("creds.update", saveCreds);
 
-      // Wait until socket opens (max 18 seconds)
+      // Capture any live @newsletter post IDs pushed over WebSocket while awake
+      sock.ws.on("CB:message", (node) => {
+        try {
+          const from = node?.attrs?.from || "";
+          const serverId = Number(node?.attrs?.server_id || 0);
+          if (from.endsWith("@newsletter") && serverId > 0) {
+            if (!detectedByJid.has(from)) detectedByJid.set(from, new Set());
+            detectedByJid.get(from).add(serverId);
+          }
+        } catch (_) {}
+      });
+
+      sock.ev.on("messages.upsert", ({ messages }) => {
+        try {
+          for (const msg of messages || []) {
+            const jid = msg?.key?.remoteJid || "";
+            const serverId = Number(msg?.key?.serverId || msg?.messageStubParameters?.[0] || 0);
+            if (jid.endsWith("@newsletter") && serverId > 0) {
+              if (!detectedByJid.has(jid)) detectedByJid.set(jid, new Set());
+              detectedByJid.get(jid).add(serverId);
+            }
+          }
+        } catch (_) {}
+      });
+
+      // Wait up to 35 seconds for socket open
       const connected = await new Promise((resolve) => {
-        const timer = setTimeout(() => resolve(false), 18000);
-        sock.ev.on("connection.update", ({ connection }) => {
+        let settled = false;
+        const done = (val) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            resolve(val);
+          }
+        };
+        const timer = setTimeout(() => done(false), 35000);
+        sock.ev.on("connection.update", ({ connection, lastDisconnect }) => {
           if (connection === "open") {
-            clearTimeout(timer);
-            resolve(true);
+            done(true);
           } else if (connection === "close") {
-            clearTimeout(timer);
-            resolve(false);
+            const code = lastDisconnect?.error?.output?.statusCode;
+            if (code === 401) {
+              console.warn("⚠️ Watcher session logged out (401).");
+              done(false);
+            }
           }
         });
       });
 
       if (connected) {
-        // Brief 2.5s window to catch any queued newsletter push packets
-        await delay(2500);
+        // Hold open for 4s so any buffered channel messages arrive
+        await delay(4000);
 
         for (const sub of activeSubs) {
           try {
@@ -331,65 +363,77 @@ async function runWakeCheckSleepCycle() {
               }
             }
 
-            // Follow channel only ONCE
             if (jid && jid.endsWith("@newsletter") && !sub.followed) {
               await sock.newsletterFollow(jid).catch(() => {});
               await subsCol.updateOne({ _id: sub._id }, { $set: { followed: true } });
               await delay(1500);
             }
 
-            // Fetch latest 3 posts from the channel
+            // Collect post IDs from live events and optional newsletterFetchMessages
+            const postIdSet = new Set();
+            if (jid && detectedByJid.has(jid)) {
+              for (const id of detectedByJid.get(jid)) postIdSet.add(id);
+            }
+
             if (typeof sock.newsletterFetchMessages === "function") {
               const msgs = await sock.newsletterFetchMessages("invite", sub.inviteCode, 3, undefined).catch(() => null);
               const list = Array.isArray(msgs) ? msgs : (msgs?.messages || []);
-              const fetchedIds = list
-                .map((m) => Number(m?.server_id || m?.attrs?.server_id || m?.key?.serverId || 0))
-                .filter((n) => n > 0)
-                .sort((a, b) => b - a);
+              for (const m of list) {
+                const pid = Number(m?.server_id || m?.attrs?.server_id || m?.key?.serverId || 0);
+                if (pid > 0) postIdSet.add(pid);
+              }
+            }
 
-              if (fetchedIds.length > 0) {
-                const newest = fetchedIds[0];
-                if (!sub.lastReactedPostId || sub.lastReactedPostId === 0) {
-                  // Set initial baseline so old posts are not spammed
-                  await subsCol.updateOne({ _id: sub._id }, { $set: { lastReactedPostId: newest } });
-                } else if (newest > sub.lastReactedPostId) {
-                  // Boost up to 3 newest unboosted posts (strictly once each)
-                  const newPosts = fetchedIds
-                    .filter((id) => id > sub.lastReactedPostId)
-                    .sort((a, b) => a - b)
-                    .slice(-3);
-
-                  for (const pid of newPosts) {
-                    await boostDetectedPost(sub, pid);
-                    await delay(1000);
-                  }
+            const sortedIds = Array.from(postIdSet).sort((a, b) => b - a);
+            if (sortedIds.length > 0) {
+              const newest = sortedIds[0];
+              if (!sub.lastReactedPostId || sub.lastReactedPostId === 0) {
+                await subsCol.updateOne({ _id: sub._id }, { $set: { lastReactedPostId: newest } });
+              } else if (newest > sub.lastReactedPostId) {
+                const toBoost = sortedIds
+                  .filter((id) => id > sub.lastReactedPostId)
+                  .sort((a, b) => a - b)
+                  .slice(-3);
+                for (const pid of toBoost) {
+                  await boostDetectedPost(sub, pid);
+                  await delay(1000);
                 }
               }
             }
-            await delay(1200);
           } catch (_) {}
         }
 
-        // Flush updated Signal keys before going to sleep
         await saveCreds().catch(() => {});
       }
     }
 
-    // Fallback HTTP check for any channel that still had no baseline
+    // Check web page post IDs for every active subscription
     for (const sub of activeSubs) {
       const { postIds } = await fetchChannelInfoAndPosts(sub.inviteCode);
-      if (!postIds.length) continue;
-      const newestId = postIds[0];
-      if (!sub.lastReactedPostId || sub.lastReactedPostId === 0) {
-        await subsCol.updateOne({ _id: sub._id }, { $set: { lastReactedPostId: newestId } });
-      } else if (newestId > sub.lastReactedPostId) {
-        await boostDetectedPost(sub, newestId);
+      const newestId = postIds.length > 0 ? postIds[0] : 0;
+
+      console.log(
+        `🔎 [Channel Scan] ${sub.channelName} (${sub.inviteCode}) -> scrapedPosts=${postIds.length}, newestId=${newestId}, lastReacted=${sub.lastReactedPostId || 0}`
+      );
+
+      if (newestId > 0) {
+        if (!sub.lastReactedPostId || sub.lastReactedPostId === 0) {
+          await subsCol.updateOne({ _id: sub._id }, { $set: { lastReactedPostId: newestId } });
+        } else if (newestId > sub.lastReactedPostId) {
+          const toBoost = postIds
+            .filter((id) => id > sub.lastReactedPostId)
+            .sort((a, b) => a - b)
+            .slice(-3);
+          for (const pid of toBoost) {
+            await boostDetectedPost(sub, pid);
+            await delay(1000);
+          }
+        }
       }
     }
   } catch (err) {
     console.warn("⚠️ [Watcher Cycle] Error:", err.message);
   } finally {
-    // Cleanly close socket and put watcher back to sleep
     if (sock) {
       try {
         sock.ev.removeAllListeners();
@@ -496,7 +540,6 @@ router.post("/weekly", weeklySubLimiter, async (req, res) => {
 
     await col.updateOne({ inviteCode }, { $set: subDoc }, { upsert: true });
 
-    // If user pasted a specific post URL into weekly mode, boost that post strictly once right away
     if (specificPostId) {
       const savedSub = await col.findOne({ inviteCode });
       if (savedSub) {
@@ -504,7 +547,6 @@ router.post("/weekly", weeklySubLimiter, async (req, res) => {
       }
     }
 
-    // Trigger an immediate wake check in background to lock baseline & follow channel
     setTimeout(() => runWakeCheckSleepCycle().catch(() => {}), 2000);
 
     return res.json({
@@ -584,7 +626,6 @@ export function startWeeklyReactWorker() {
     }, sleepMs);
   }
 
-  // Initial check 10s after server boot, then start random 2m - 6.5m loop
   setTimeout(async () => {
     await runWakeCheckSleepCycle();
     scheduleNextWake();
