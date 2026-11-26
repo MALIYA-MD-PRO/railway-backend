@@ -12,7 +12,6 @@ import http       from "http";
 import rateLimit  from "express-rate-limit";
 import { createRequire } from "module";
 
-// ── CJS packages (hpp, cookie-parser, express-session) via createRequire ──
 const require        = createRequire(import.meta.url);
 const hpp            = require("hpp");
 const cookieParser   = require("cookie-parser");
@@ -37,6 +36,7 @@ import chatRouter       from "./chat.js";
 import ytRouter         from "./yt.js";
 import authRouter, { passport } from "./auth.js";
 import apiKeysRouter    from "./api-keys.js";
+import reactRouter, { startWeeklyReactWorker } from "./react.js";
 import { getSessionId, setSessionId } from "./session-store.js";
 
 const app        = express();
@@ -46,27 +46,23 @@ const PORT       = process.env.PORT || 3000;
 
 import("events").then((m) => { m.EventEmitter.defaultMaxListeners = 500; });
 
-// ─────────────────────────────────────────────────────────────────
-//  Trust Replit's reverse proxy — real client IP from X-Forwarded-For
-// ─────────────────────────────────────────────────────────────────
 app.set("trust proxy", 1);
+app.disable("x-powered-by");
 
 // ─────────────────────────────────────────────────────────────────
 //  LAYER 01 — HELMET: HTTP security headers
-//  (XSS, clickjacking, MIME sniffing protection)
 // ─────────────────────────────────────────────────────────────────
 app.use(helmet({
-  contentSecurityPolicy:    false, // pair.html uses inline scripts
+  contentSecurityPolicy:     false,
   crossOriginEmbedderPolicy: false,
+  referrerPolicy:            { policy: "strict-origin-when-cross-origin" },
 }));
 
 // ─────────────────────────────────────────────────────────────────
-//  LAYER 02 — CORS: allow Replit + Vercel + custom FRONTEND_URL
-//  Set FRONTEND_URL env var on Railway for a custom domain, e.g.
-//  "https://maliya-md.vercel.app"
+//  LAYER 02 — CORS
 // ─────────────────────────────────────────────────────────────────
 const _FRONTEND_URL = process.env.FRONTEND_URL || "";
-delete process.env.FRONTEND_URL; // keep env clean
+delete process.env.FRONTEND_URL;
 
 app.use(cors({
   origin: (origin, cb) => {
@@ -78,7 +74,7 @@ app.use(cors({
       /\.repl\.run$/.test(origin)  ||
       /\.vercel\.app$/.test(origin) ||
       /\.vercel\.dev$/.test(origin) ||
-      /^http:\/\/localhost(:\d+)?$/.test(origin) || // ✅ localhost testing
+      /^http:\/\/localhost(:\d+)?$/.test(origin) ||
       (_FRONTEND_URL && origin === _FRONTEND_URL)
     ) {
       cb(null, true);
@@ -87,52 +83,42 @@ app.use(cors({
       cb(new Error("CORS: origin not allowed"));
     }
   },
-  methods:        ["GET", "POST", "DELETE", "OPTIONS"], // ✅ OPTIONS added
-  allowedHeaders: ["Content-Type", "Authorization", "x-api-key", "x-settings-token"], // ✅ x-settings-token added
-  credentials:    true,   // required for cross-origin HttpOnly cookies
+  methods:        ["GET", "POST", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-api-key", "x-settings-token"],
+  credentials:    true,
 }));
 
 // ─────────────────────────────────────────────────────────────────
-//  LAYER 03 — PAYLOAD SIZE LIMIT: block oversized JSON bodies
-//  Prevents DoS via huge POST payloads (max 10 kb)
+//  LAYER 03 — PAYLOAD SIZE LIMIT
 // ─────────────────────────────────────────────────────────────────
 app.use(express.json({ limit: "10kb" }));
 app.use(express.urlencoded({ extended: true, limit: "10kb" }));
 
 // ─────────────────────────────────────────────────────────────────
-//  LAYER 04 — HPP: HTTP Parameter Pollution protection
-//  Blocks ?sort=asc&sort=desc array injection attacks
-//  Must come AFTER body parsers
+//  LAYER 04 — HPP
 // ─────────────────────────────────────────────────────────────────
 app.use(hpp());
 
 // ─────────────────────────────────────────────────────────────────
-//  LAYER 05 — COOKIE PARSER: read HttpOnly JWT cookies
+//  LAYER 05 — COOKIE PARSER & SESSION
 // ─────────────────────────────────────────────────────────────────
 app.use(cookieParser());
-
-// ─────────────────────────────────────────────────────────────────
-//  LAYER 05b — SESSION + PASSPORT (Google OAuth)
-// ─────────────────────────────────────────────────────────────────
 app.use(session({
   secret:            getSessionSecret() || "maliya-md-fallback-secret",
   resave:            false,
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
-    // On Railway (production) cookies cross Vercel→Railway over HTTPS,
-    // so sameSite must be "none" + secure:true.
-    // On Replit (dev) keep "lax" + secure:false.
     secure:   process.env.NODE_ENV === "production",
     sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
-    maxAge:   7 * 24 * 60 * 60 * 1000,  // 7 days
+    maxAge:   7 * 24 * 60 * 60 * 1000,
   },
 }));
 app.use(passport.initialize());
 app.use(passport.session());
 
 // ─────────────────────────────────────────────────────────────────
-//  Unban list — IPs that passed the unban code check
+//  Unban list & Rate Limiter
 // ─────────────────────────────────────────────────────────────────
 const unbanList = new Map();
 
@@ -141,10 +127,6 @@ function getClientIP(req) {
   return forwarded ? forwarded.split(",")[0].trim() : req.socket.remoteAddress;
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  LAYER 06 — RATE LIMITER: 10 requests / 24 h per IP
-//  Applied to /pair and /qr. Logs hits to security.log
-// ─────────────────────────────────────────────────────────────────
 const generateLimiter = rateLimit({
   windowMs: 24 * 60 * 60 * 1000,
   max: 10,
@@ -176,18 +158,18 @@ const generateLimiter = rateLimit({
 // ─────────────────────────────────────────────────────────────────
 //  Health / ping
 // ─────────────────────────────────────────────────────────────────
-app.get(["/health", "/_health", "/ping"], (_req, res) => res.status(200).send("OK"));
+app.get(["/health", "/_health", "/ping"], (_req, res) => {
+  res.status(200).json({ status: "OK", message: "Server is healthy" });
+});
 
 // ─────────────────────────────────────────────────────────────────
-//  SSE log stream — open to same-origin clients (pair/QR console)
-//  Sensitive values are already deleted from process.env by security.js
-//  and console.error auto-redacts via its patched wrapper there.
+//  SSE log stream
 // ─────────────────────────────────────────────────────────────────
 app.get("/events", (req, res) => {
   res.set({
-    "Content-Type":    "text/event-stream",
-    "Cache-Control":   "no-cache",
-    Connection:        "keep-alive",
+    "Content-Type":      "text/event-stream",
+    "Cache-Control":     "no-cache",
+    Connection:          "keep-alive",
     "X-Accel-Buffering": "no",
   });
   res.flushHeaders();
@@ -197,9 +179,7 @@ app.get("/events", (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────
-//  LAYER 07 — NoSQL INJECTION PROTECTION (Express 5 compatible)
-//  Blocks keys starting with '$' or containing '.'
-//  Also logs each blocked attempt to security.log
+//  LAYER 07 — NoSQL INJECTION PROTECTION
 // ─────────────────────────────────────────────────────────────────
 function sanitizeMongo(obj, ip = "") {
   if (!obj || typeof obj !== "object") return;
@@ -208,7 +188,6 @@ function sanitizeMongo(obj, ip = "") {
       const safeKey = key.replace(/\$/g, "_").replace(/\./g, "_");
       obj[safeKey]  = obj[key];
       delete obj[key];
-      console.warn(`⚠️ NoSQL injection key blocked: "${key}" → "${safeKey}"`);
       securityLogger.warn(`NOSQL_INJECTION_BLOCKED ip=${ip} key="${key}"`);
     } else if (typeof obj[key] === "object" && obj[key] !== null) {
       sanitizeMongo(obj[key], ip);
@@ -224,27 +203,27 @@ app.use((req, _res, next) => {
 });
 
 // ─────────────────────────────────────────────────────────────────
-//  Static files + home page
+//  Static files + Multi-Page Routes (index, pair, settings, react)
 // ─────────────────────────────────────────────────────────────────
-app.use(express.static(__dirname));
+app.use(express.static(__dirname, { index: false }));
 
-app.get("/", (_req, res) => {
-  try {
-    res.set({ "Cache-Control": "no-store, no-cache, must-revalidate", Pragma: "no-cache" });
-    res.sendFile(path.join(__dirname, "pair.html"));
-  } catch (err) {
-    console.error("UI load error:", err);
-    res.status(500).send("Error loading UI");
-  }
-});
+function sendHtmlPage(res, fileName) {
+  res.set({ "Cache-Control": "no-store, no-cache, must-revalidate", Pragma: "no-cache" });
+  res.sendFile(path.join(__dirname, fileName));
+}
+
+app.get(["/", "/index.html"], (_req, res) => sendHtmlPage(res, "index.html"));
+app.get(["/pair", "/pair.html"], (_req, res) => sendHtmlPage(res, "pair.html"));
+app.get(["/settings", "/settings.html"], (_req, res) => sendHtmlPage(res, "settings.html"));
+app.get(["/react", "/react.html"], (_req, res) => sendHtmlPage(res, "react.html"));
 
 // ─────────────────────────────────────────────────────────────────
-//  Unban verification endpoint  POST /unban-verify { code }
+//  Unban verification endpoint
 // ─────────────────────────────────────────────────────────────────
 app.post("/unban-verify", (req, res) => {
-  const { code }       = req.body || {};
-  const correctCode    = getUnbanCode();
-  const ip             = getClientIP(req);
+  const { code }    = req.body || {};
+  const correctCode = getUnbanCode();
+  const ip          = getClientIP(req);
 
   if (!correctCode) {
     return res.status(503).json({ ok: false, error: "Unban service not configured." });
@@ -259,24 +238,20 @@ app.post("/unban-verify", (req, res) => {
     if (expiry < Date.now()) unbanList.delete(key);
   }
 
-  console.log(`✅ Unban granted for IP: ${ip}`);
   res.json({ ok: true });
 });
 
 // ─────────────────────────────────────────────────────────────────
-//  LAYER 08 — JWT AUTH (Bearer header + HttpOnly Cookie)
-//  /admin/token  → issues token as HttpOnly Secure cookie AND JSON
-//  requireJWT    → accepts either Bearer header or cookie
+//  JWT AUTH
 // ─────────────────────────────────────────────────────────────────
 function requireJWT(req, res, next) {
   const secret = getUnbanCode();
   if (!secret) return res.status(503).json({ ok: false, error: "Auth not configured." });
 
-  // Accept from cookie (preferred) or Authorization: Bearer header
   const fromCookie = req.cookies?.adminToken;
-  const authHeader  = req.headers["authorization"] || "";
-  const fromHeader  = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-  const token       = fromCookie || fromHeader;
+  const authHeader = req.headers["authorization"] || "";
+  const fromHeader = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  const token      = fromCookie || fromHeader;
 
   if (!token) {
     securityLogger.warn(`AUTH_MISSING ip=${getClientIP(req)} path=${req.path}`);
@@ -291,7 +266,6 @@ function requireJWT(req, res, next) {
   }
 }
 
-// POST /admin/token — issue 1-hour JWT; set as HttpOnly cookie + JSON
 app.post("/admin/token", (req, res) => {
   const secret = getUnbanCode();
   if (!secret) return res.status(503).json({ ok: false, error: "Auth not configured." });
@@ -306,20 +280,16 @@ app.post("/admin/token", (req, res) => {
 
   const token = jwt.sign({ role: "admin" }, secret, { expiresIn: "1h" });
 
-  // ── LAYER 09 — HttpOnly Secure Cookie ───────────────────────
-  //  JS ගෙන් read කරන්නේ බෑ → XSS attacks ට token leak නොවෙ
   res.cookie("adminToken", token, {
     httpOnly: true,
     secure:   process.env.NODE_ENV === "production",
     sameSite: "strict",
-    maxAge:   60 * 60 * 1000, // 1 hour
+    maxAge:   60 * 60 * 1000,
   });
 
-  console.log(`🔑 Admin JWT issued for IP: ${ip}`);
-  res.json({ ok: true, token }); // token ත් return (backward compat)
+  res.json({ ok: true, token });
 });
 
-// POST /admin/logout — clear the HttpOnly cookie
 app.post("/admin/logout", (_req, res) => {
   res.clearCookie("adminToken");
   res.json({ ok: true });
@@ -329,31 +299,23 @@ app.get("/session-id", (_req, res) => res.json({ sessionId: getSessionId() }));
 
 app.post("/session-id/clear", requireJWT, (_req, res) => {
   setSessionId("");
-  console.log(`🗑️ Session cleared by admin (IP: ${getClientIP(_req)})`);
   res.json({ ok: true });
 });
 
-// Health check — Railway / uptime monitors
-app.get("/health", (_req, res) => {
-  res.status(200).json({ status: "OK", message: "Server is healthy" });
-});
-
-// Google OAuth
-app.use("/auth",     authRouter);
-app.use("/api-keys", apiKeysRouter);
-
-// Apply rate limiter to pair and qr routes
-app.use("/pair",     generateLimiter, pairRouter);
-app.use("/qr",       generateLimiter, qrRouter);
-app.use("/api/chat", chatRouter);
-app.use("/yt",       ytRouter);
-
-// Secret admin panel — no link from main site, pw-protected
-app.use("/x-admin", adminPanelRouter);
+// ─────────────────────────────────────────────────────────────────
+//  API Routes
+// ─────────────────────────────────────────────────────────────────
+app.use("/auth",      authRouter);
+app.use("/api-keys",  apiKeysRouter);
+app.use("/api/react", reactRouter);
+app.use("/pair",      generateLimiter, pairRouter);
+app.use("/qr",        generateLimiter, qrRouter);
+app.use("/api/chat",  chatRouter);
+app.use("/yt",        ytRouter);
+app.use("/x-admin",   adminPanelRouter);
 
 // ─────────────────────────────────────────────────────────────────
-//  LAYER 10 — SECURE GLOBAL ERROR HANDLER
-//  Redacts sensitive values, never leaks stack traces
+//  SECURE GLOBAL ERROR HANDLER
 // ─────────────────────────────────────────────────────────────────
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, _next) => {
@@ -366,7 +328,10 @@ app.use((err, req, res, _next) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ Server running on port ${PORT}`);
-  warmupDb().then(() => { setInterval(keepAlivePing, 30 * 1000); });
+  warmupDb().then(() => {
+    setInterval(keepAlivePing, 30 * 1000);
+    startWeeklyReactWorker();
+  });
   setInterval(() => {
     http.get(`http://localhost:${PORT}/health`, (r) => r.resume()).on("error", () => {});
   }, 4 * 60 * 1000);
