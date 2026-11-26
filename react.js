@@ -26,8 +26,9 @@ const BOOSTED_POSTS_COLLECTION = "boosted_channel_posts";
 const CHANNEL_POST_RE = /^https?:\/\/(www\.)?whatsapp\.com\/channel\/([A-Za-z0-9_-]{10,45})\/(\d{1,12})\/?$/;
 const CHANNEL_ONLY_RE = /^https?:\/\/(www\.)?whatsapp\.com\/channel\/([A-Za-z0-9_-]{10,45})\/?$/;
 
-// In-memory lock to prevent race conditions within the same tick
+// In-memory locks to prevent race conditions & duplicate follow calls
 const inFlightPosts = new Set();
+const followedJids = new Set();
 
 function getApiKey() {
   return CACHED_WPRH_KEY || process.env.WPRH_API_KEY || "";
@@ -177,8 +178,7 @@ async function boostDetectedPost(sub, postId) {
       await subsCol.updateOne(
         { _id: sub._id },
         {
-          $max: { lastReactedPostId: numericId },
-          $inc: { reactedPostsCount: 1 },
+          $max: { lastReactedPostId: numericId },$inc: { reactedPostsCount: 1 },
         }
       );
 
@@ -243,7 +243,7 @@ async function fetchChannelInfoAndPosts(inviteCode) {
   return { title, postIds: sortedIds };
 }
 
-// ── Persistent Baileys Newsletter Watcher (Real-Time + Active Fetch) ──
+// ── Safe Persistent Baileys Newsletter Watcher ───────────────────
 let watcherSock = null;
 let watcherReady = false;
 
@@ -275,13 +275,20 @@ async function syncWatcherFollowsAndPoll() {
           }
         }
 
-        if (jid && jid.endsWith("@newsletter")) {
+        // Follow ONLY ONCE per channel to keep the watcher account completely safe
+        if (jid && jid.endsWith("@newsletter") && !sub.followed && !followedJids.has(jid)) {
           await watcherSock.newsletterFollow(jid).catch(() => {});
+          followedJids.add(jid);
+          await db.collection(WEEKLY_COLLECTION).updateOne(
+            { _id: sub._id },
+            { $set: { followed: true } }
+          );
+          await delay(2500);
         }
 
-        // Actively fetch latest 3 messages from the channel as backup to live push
+        // Safe backup check for latest 2 posts
         if (typeof watcherSock.newsletterFetchMessages === "function") {
-          const msgs = await watcherSock.newsletterFetchMessages("invite", sub.inviteCode, 3, undefined).catch(() => null);
+          const msgs = await watcherSock.newsletterFetchMessages("invite", sub.inviteCode, 2, undefined).catch(() => null);
           const list = Array.isArray(msgs) ? msgs : (msgs?.messages || []);
           const fetchedIds = list
             .map((m) => Number(m?.server_id || m?.attrs?.server_id || m?.key?.serverId || 0))
@@ -290,7 +297,6 @@ async function syncWatcherFollowsAndPoll() {
 
           if (fetchedIds.length > 0) {
             const newest = fetchedIds[0];
-            // If channel had no baseline yet, set baseline to current newest so old posts aren't spammed
             if (!sub.lastReactedPostId || sub.lastReactedPostId === 0) {
               await db.collection(WEEKLY_COLLECTION).updateOne(
                 { _id: sub._id },
@@ -300,6 +306,7 @@ async function syncWatcherFollowsAndPoll() {
               await boostDetectedPost(sub, newest);
             }
           }
+          await delay(1500);
         }
       } catch (_) {}
     }
@@ -309,7 +316,7 @@ async function syncWatcherFollowsAndPoll() {
 async function startBaileysNewsletterWatcher() {
   const sid = getWatcherSessionId();
   if (!sid) {
-    console.log("⚠️ WATCHER_SESSION_ID not set — add a spare session ID in Railway Variables for 1s live post detection.");
+    console.log("⚠️ WATCHER_SESSION_ID not set — add a spare watcher session ID in Railway Variables.");
     return;
   }
 
@@ -348,7 +355,7 @@ async function startBaileysNewsletterWatcher() {
           watcherReady = false;
           const code = lastDisconnect?.error?.output?.statusCode;
           if (code !== 401) {
-            await delay(5000);
+            await delay(8000);
             connectWatcher();
           } else {
             console.warn("🛑 Watcher session logged out (401). Update WATCHER_SESSION_ID.");
@@ -356,7 +363,7 @@ async function startBaileysNewsletterWatcher() {
         }
       });
 
-      // Engine 1: Raw XMPP <message from="120363...@newsletter" server_id="825"> push
+      // Engine 1: Live XMPP <message from="120363...@newsletter" server_id="825"> push (Triggers in 1-2s)
       sock.ws.on("CB:message", async (node) => {
         try {
           const from = node?.attrs?.from || "";
@@ -476,15 +483,18 @@ router.post("/weekly", weeklySubLimiter, async (req, res) => {
     let channelName = decodeHtmlEntities(scraped.title);
     let jid = `${inviteCode}@newsletter`;
     let baselinePostId = scraped.postIds.length > 0 ? scraped.postIds[0] : (specificPostId || 0);
+    let followed = false;
 
-    // Resolve real @newsletter JID & follow channel immediately if watcher socket is online
+    // Resolve real @newsletter JID & follow channel once if watcher socket is online
     if (watcherSock && watcherReady) {
       try {
         const meta = await watcherSock.newsletterMetadata("invite", inviteCode);
         if (meta?.id) jid = meta.id;
         if (meta?.name) channelName = decodeHtmlEntities(meta.name);
-        if (jid.endsWith("@newsletter")) {
+        if (jid.endsWith("@newsletter") && !followedJids.has(jid)) {
           await watcherSock.newsletterFollow(jid);
+          followedJids.add(jid);
+          followed = true;
         }
         if (typeof watcherSock.newsletterFetchMessages === "function") {
           const msgs = await watcherSock.newsletterFetchMessages("invite", inviteCode, 2, undefined).catch(() => null);
@@ -512,6 +522,7 @@ router.post("/weekly", weeklySubLimiter, async (req, res) => {
       channelName,
       count,
       emojis,
+      followed,
       lastReactedPostId: baselinePostId,
       reactedPostsCount: 0,
       active: true,
@@ -594,18 +605,16 @@ router.get("/weekly/:inviteCode", async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════
-//  Background Worker: Runs Active Watcher Sync & Fallback Poller (45s)
+//  Background Worker: Safe 15-Minute Backup Poller (Live Push is 1-2s)
 // ═════════════════════════════════════════════════════════════════
 export function startWeeklyReactWorker() {
   startBaileysNewsletterWatcher().catch(() => {});
 
-  const POLL_INTERVAL_MS = 15 * 1000;
+  const POLL_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes safe backup interval
   setInterval(async () => {
     try {
-      // 1. Run Baileys active channel follow + fetch check
       await syncWatcherFollowsAndPoll();
 
-      // 2. Run HTTP multi-UA fallback check
       const db = await getReactDb();
       const col = db.collection(WEEKLY_COLLECTION);
       const activeSubs = await col
@@ -623,7 +632,6 @@ export function startWeeklyReactWorker() {
         }
 
         if (newestId > sub.lastReactedPostId) {
-          // Only boost the newest post (or up to 2 newest) — strictly once each via unique index
           const candidates = postIds
             .filter((id) => id > sub.lastReactedPostId)
             .sort((a, b) => a - b)
@@ -639,7 +647,7 @@ export function startWeeklyReactWorker() {
     }
   }, POLL_INTERVAL_MS);
 
-  console.log("🚀 Weekly Channel Auto-React Worker started (Live XMPP + 45s Active Poller)");
+  console.log("🚀 Weekly Channel Auto-React Worker started (Live XMPP + 15m Safe Poller)");
 }
 
 export default router;
