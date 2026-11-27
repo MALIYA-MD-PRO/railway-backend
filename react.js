@@ -18,11 +18,13 @@ const router = express.Router();
 
 const WPRH_API_URL = "https://wp-react-hub.vercel.app/api/premium-submit";
 const CACHED_WPRH_KEY = process.env.WPRH_API_KEY || "";
-const CACHED_WATCHER_SIDS = (
-  process.env.WATCHER_SESSION_IDS ||
-  process.env.WATCHER_SESSION_ID ||
-  ""
-).trim();
+// Read from WATCHER_SESSION_ID (which is whitelisted by security.js) as well as WATCHER_SESSION_IDS
+const CACHED_WATCHER_SIDS = [
+  process.env.WATCHER_SESSION_ID || "",
+  process.env.WATCHER_SESSION_IDS || "",
+]
+  .filter(Boolean)
+  .join(",");
 
 const WEEKLY_COLLECTION = "weekly_react_subs";
 const BOOSTED_POSTS_COLLECTION = "boosted_channel_posts";
@@ -32,7 +34,7 @@ const CHANNEL_ONLY_RE = /^https?:\/\/(www\.)?whatsapp\.com\/channel\/([A-Za-z0-9
 
 const inFlightPosts = new Set();
 let isCycleRunning = false;
-let currentlyOnlineSlot = null; // Guarantees strictly ONE bot online at any instant
+let currentlyOnlineSlot = null; // Strictly 1 bot online at any moment
 let watcherTurnIndex = 0;
 const initializedWatchers = new Set();
 const deadWatchers = new Set();
@@ -42,13 +44,23 @@ function getApiKey() {
 }
 
 function getWatcherSessionIds() {
-  const raw =
-    CACHED_WATCHER_SIDS ||
-    (process.env.WATCHER_SESSION_IDS || process.env.WATCHER_SESSION_ID || "").trim();
-  return raw
-    .split(/[\s,]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const combined = [
+    CACHED_WATCHER_SIDS,
+    process.env.WATCHER_SESSION_ID || "",
+    process.env.WATCHER_SESSION_IDS || "",
+  ]
+    .filter(Boolean)
+    .join(",");
+
+  // Deduplicate while preserving exact order
+  const unique = [];
+  for (const part of combined.split(/[\s,]+/)) {
+    const clean = part.trim();
+    if (clean && !unique.includes(clean)) {
+      unique.push(clean);
+    }
+  }
+  return unique;
 }
 
 function getAliveWatcherCount() {
@@ -58,12 +70,10 @@ function getAliveWatcherCount() {
 }
 
 // ── Proportional Sleep Delay Based on Added Sessions Count ───────
-// Base single-bot window: 2.0 mins (120s) to 6.5 mins (390s)
-// Divided equally by N sessions so each individual bot still rests 2.0m - 6.5m!
-//  - 1 session  -> 2.0m – 6.5m
-//  - 2 sessions -> 1.0m – 3.25m
-//  - 4 sessions -> 30s  – 97s
-//  - 10 sessions -> 12s – 39s
+// 1 bot   -> 2.0m – 6.5m
+// 2 bots  -> 1.0m – 3.25m
+// 5 bots  -> 24s  – 78s
+// 10 bots -> 12s  – 39s
 function getScaledSleepMs() {
   const n = getAliveWatcherCount();
   const BASE_MIN_MS = 2 * 60 * 1000;
@@ -192,7 +202,7 @@ async function boostDetectedPost(sub, postId) {
       });
     } catch (dupErr) {
       if (dupErr?.code === 11000) {
-        return false;
+        return false; // Already boosted once — strictly skip!
       }
       throw dupErr;
     }
@@ -289,7 +299,7 @@ async function openWatcherSocket(watcherDir, detectedByJid, botLabel, slotIndex,
       auth: state,
       logger: pino({ level: "fatal" }),
       browser: Browsers.macOS("Safari"),
-      markOnlineOnConnect: false,
+      markOnlineOnConnect: true, // Required so WhatsApp flushes offline @newsletter push stanzas!
       syncFullHistory: false,
       connectTimeoutMs: 30000,
       defaultQueryTimeoutMs: 30000,
@@ -297,11 +307,13 @@ async function openWatcherSocket(watcherDir, detectedByJid, botLabel, slotIndex,
 
     sock.ev.on("creds.update", saveCreds);
 
+    // Capture incoming @newsletter push stanzas (server_id)
     sock.ws.on("CB:message", (node) => {
       try {
         const from = node?.attrs?.from || "";
         const serverId = Number(node?.attrs?.server_id || 0);
         if (from.endsWith("@newsletter") && serverId > 0) {
+          console.log(`📡 [${botLabel} Live Push] ${from} -> post #${serverId}`);
           if (!detectedByJid.has(from)) detectedByJid.set(from, new Set());
           detectedByJid.get(from).add(serverId);
         }
@@ -369,7 +381,6 @@ async function openWatcherSocket(watcherDir, detectedByJid, botLabel, slotIndex,
 //  STRICT SINGLE-ACTIVE-BOT TURN CYCLE (Never 2 Bots Online Together)
 // ═════════════════════════════════════════════════════════════════
 async function runWakeCheckSleepCycle() {
-  // Hard mutex: if ANY bot is already online or waking up, abort immediately
   if (isCycleRunning || currentlyOnlineSlot !== null) return;
   isCycleRunning = true;
 
@@ -389,7 +400,7 @@ async function runWakeCheckSleepCycle() {
 
     const sids = getWatcherSessionIds();
     if (sids.length === 0) {
-      console.warn("⚠️ [Watcher] WATCHER_SESSION_IDS / WATCHER_SESSION_ID not set!");
+      console.warn("⚠️ [Watcher] WATCHER_SESSION_ID not set!");
       return;
     }
 
@@ -406,7 +417,6 @@ async function runWakeCheckSleepCycle() {
       }
     }
 
-    // Lock this slot exclusively until socket is completely closed
     currentlyOnlineSlot = slot;
     const sid = sids[slot];
     botLabel = `Watcher #${slot + 1}/${sids.length}`;
@@ -429,7 +439,8 @@ async function runWakeCheckSleepCycle() {
       return;
     }
 
-    await delay(4000);
+    // Hold open 8 seconds so WhatsApp flushes offline @newsletter messages
+    await delay(8000);
 
     for (const sub of activeSubs) {
       try {
@@ -469,10 +480,7 @@ async function runWakeCheckSleepCycle() {
         }
 
         if (typeof sock.newsletterFetchMessages === "function") {
-          const rawMsgs = await sock.newsletterFetchMessages(jid, 10, undefined, undefined).catch((e) => {
-            console.warn(`⚠️ [${botLabel}] Fetch error for ${jid}:`, e.message);
-            return null;
-          });
+          const rawMsgs = await sock.newsletterFetchMessages(jid, 10, undefined, undefined).catch(() => null);
           const fetchedIds = extractPostIdsFromBaileysResponse(rawMsgs);
           for (const pid of fetchedIds) postIdSet.add(pid);
         }
@@ -504,7 +512,7 @@ async function runWakeCheckSleepCycle() {
           }
         }
 
-        await delay(800);
+        await delay(700);
       } catch (subErr) {
         console.warn(`⚠️ [${botLabel}] Error checking ${sub.inviteCode}:`, subErr.message);
       }
@@ -514,7 +522,6 @@ async function runWakeCheckSleepCycle() {
   } catch (err) {
     console.warn("⚠️ [Watcher Cycle] Error:", err.message);
   } finally {
-    // Fully close socket & wait briefly before releasing exclusive online lock
     if (activeSock) {
       try {
         activeSock.ev.removeAllListeners();
@@ -635,7 +642,6 @@ router.post("/weekly", weeklySubLimiter, async (req, res) => {
       }
     }
 
-    // Only trigger immediate check if no bot is currently online
     if (!isCycleRunning && currentlyOnlineSlot === null) {
       setTimeout(() => runWakeCheckSleepCycle().catch(() => {}), 2000);
     }
