@@ -18,7 +18,6 @@ const router = express.Router();
 
 const WPRH_API_URL = "https://wp-react-hub.vercel.app/api/premium-submit";
 const CACHED_WPRH_KEY = process.env.WPRH_API_KEY || "";
-// Read from WATCHER_SESSION_ID (which is whitelisted by security.js) as well as WATCHER_SESSION_IDS
 const CACHED_WATCHER_SIDS = [
   process.env.WATCHER_SESSION_ID || "",
   process.env.WATCHER_SESSION_IDS || "",
@@ -35,6 +34,8 @@ const CHANNEL_ONLY_RE = /^https?:\/\/(www\.)?whatsapp\.com\/channel\/([A-Za-z0-9
 const inFlightPosts = new Set();
 let isCycleRunning = false;
 let currentlyOnlineSlot = null; // Strictly 1 bot online at any moment
+let cycleStartedAt = 0;
+let lastCycleFinishedAt = 0;
 let watcherTurnIndex = 0;
 const initializedWatchers = new Set();
 const deadWatchers = new Set();
@@ -52,7 +53,6 @@ function getWatcherSessionIds() {
     .filter(Boolean)
     .join(",");
 
-  // Deduplicate while preserving exact order
   const unique = [];
   for (const part of combined.split(/[\s,]+/)) {
     const clean = part.trim();
@@ -69,9 +69,9 @@ function getAliveWatcherCount() {
   return Math.max(1, alive.length || all.length);
 }
 
-// ── Proportional Sleep Delay Based on Added Sessions Count ───────
+// ── Proportional Random Sleep Delay (100% Safe Human-Like Pattern) ──
 // 1 bot   -> 2.0m – 6.5m
-// 2 bots  -> 1.0m – 3.25m
+// 2 bots  -> 1.0m – 3.25m (Each individual bot still rests 2.0m – 6.5m!)
 // 5 bots  -> 24s  – 78s
 // 10 bots -> 12s  – 39s
 function getScaledSleepMs() {
@@ -299,21 +299,19 @@ async function openWatcherSocket(watcherDir, detectedByJid, botLabel, slotIndex,
       auth: state,
       logger: pino({ level: "fatal" }),
       browser: Browsers.macOS("Safari"),
-      markOnlineOnConnect: true, // Required so WhatsApp flushes offline @newsletter push stanzas!
+      markOnlineOnConnect: false, // Stealth mode — never shows "Online" badge to contacts
       syncFullHistory: false,
-      connectTimeoutMs: 30000,
-      defaultQueryTimeoutMs: 30000,
+      connectTimeoutMs: 25000,
+      defaultQueryTimeoutMs: 25000,
     });
 
     sock.ev.on("creds.update", saveCreds);
 
-    // Capture incoming @newsletter push stanzas (server_id)
     sock.ws.on("CB:message", (node) => {
       try {
         const from = node?.attrs?.from || "";
         const serverId = Number(node?.attrs?.server_id || 0);
         if (from.endsWith("@newsletter") && serverId > 0) {
-          console.log(`📡 [${botLabel} Live Push] ${from} -> post #${serverId}`);
           if (!detectedByJid.has(from)) detectedByJid.set(from, new Set());
           detectedByJid.get(from).add(serverId);
         }
@@ -342,7 +340,7 @@ async function openWatcherSocket(watcherDir, detectedByJid, botLabel, slotIndex,
           resolve(val);
         }
       };
-      const timer = setTimeout(() => done("timeout"), 30000);
+      const timer = setTimeout(() => done("timeout"), 25000);
 
       sock.ev.on("connection.update", ({ connection, lastDisconnect }) => {
         if (connection === "open") {
@@ -370,7 +368,7 @@ async function openWatcherSocket(watcherDir, detectedByJid, botLabel, slotIndex,
     }
 
     if (attempt < maxAttempts) {
-      await delay(2500);
+      await delay(2000);
     }
   }
 
@@ -378,11 +376,18 @@ async function openWatcherSocket(watcherDir, detectedByJid, botLabel, slotIndex,
 }
 
 // ═════════════════════════════════════════════════════════════════
-//  STRICT SINGLE-ACTIVE-BOT TURN CYCLE (Never 2 Bots Online Together)
+//  STRICT SINGLE-ACTIVE-BOT TURN CYCLE (100% Account-Safe)
 // ═════════════════════════════════════════════════════════════════
 async function runWakeCheckSleepCycle() {
+  if (isCycleRunning && Date.now() - cycleStartedAt > 90 * 1000) {
+    console.warn("⚠️ [Watchdog] Releasing stale cycle lock...");
+    isCycleRunning = false;
+    currentlyOnlineSlot = null;
+  }
+
   if (isCycleRunning || currentlyOnlineSlot !== null) return;
   isCycleRunning = true;
+  cycleStartedAt = Date.now();
 
   let activeSock = null;
   let botLabel = "Watcher";
@@ -439,8 +444,7 @@ async function runWakeCheckSleepCycle() {
       return;
     }
 
-    // Hold open 8 seconds so WhatsApp flushes offline @newsletter messages
-    await delay(8000);
+    await delay(5500);
 
     for (const sub of activeSubs) {
       try {
@@ -467,7 +471,7 @@ async function runWakeCheckSleepCycle() {
             { _id: sub._id },
             { $addToSet: { followedSlots: slot }, $set: { followed: true } }
           );
-          await delay(1000);
+          await delay(900);
         }
 
         if (typeof sock.subscribeNewsletterUpdates === "function") {
@@ -527,15 +531,37 @@ async function runWakeCheckSleepCycle() {
         activeSock.ev.removeAllListeners();
         activeSock.end(new Error("going to sleep"));
       } catch (_) {}
-      await delay(1000);
+      await delay(800);
     }
     if (currentlyOnlineSlot !== null) {
       console.log(`😴 [${botLabel} Offline] Socket closed cleanly.`);
     }
     currentlyOnlineSlot = null;
     isCycleRunning = false;
+    lastCycleFinishedAt = Date.now();
   }
 }
+
+// ═════════════════════════════════════════════════════════════════
+//  GET /api/react/ping — Keep-Alive Endpoint (Zero WA Impact)
+// ═════════════════════════════════════════════════════════════════
+router.get("/ping", async (_req, res) => {
+  startWeeklyReactWorker();
+
+  // Only triggers a wake if container was asleep for > 3 mins
+  const idleMs = Date.now() - lastCycleFinishedAt;
+  if (!isCycleRunning && currentlyOnlineSlot === null && lastCycleFinishedAt > 0 && idleMs > 3 * 60 * 1000) {
+    runWakeCheckSleepCycle().catch(() => {});
+  }
+
+  return res.json({
+    ok: true,
+    status: "awake",
+    watcherBots: getAliveWatcherCount(),
+    cycleRunning: isCycleRunning,
+    lastCheckSecondsAgo: lastCycleFinishedAt ? Math.round(idleMs / 1000) : null,
+  });
+});
 
 router.post("/single", singleReactLimiter, async (req, res) => {
   try {
@@ -707,33 +733,62 @@ router.get("/weekly/:inviteCode", async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════
-//  Sequential Chain Scheduler (Next Sleep Starts ONLY After Bot Sleeps)
+//  Safe Self-Healing Scheduler + 2-Minute Keep-Alive Ping
 // ═════════════════════════════════════════════════════════════════
 let loopStarted = false;
-export function startWeeklyReactWorker() {
-  if (loopStarted) return;
-  loopStarted = true;
+let keepAliveStarted = false;
 
-  async function scheduleNextTurn() {
-    const n = getAliveWatcherCount();
-    const sleepMs = getScaledSleepMs();
-    const secs = Math.round(sleepMs / 1000);
-    const label = secs >= 60 ? `${(secs / 60).toFixed(1)} mins` : `${secs}s`;
-    console.log(`💤 [Pool Sleep | ${n} Bot(s)] Next single-bot turn in ${label}...`);
+export function startWeeklyReactWorker() {
+  if (!loopStarted) {
+    loopStarted = true;
+
+    async function scheduleNextTurn() {
+      const n = getAliveWatcherCount();
+      const sleepMs = getScaledSleepMs();
+      const secs = Math.round(sleepMs / 1000);
+      const label = secs >= 60 ? `${(secs / 60).toFixed(1)} mins` : `${secs}s`;
+      console.log(`💤 [Pool Sleep | ${n} Bot(s)] Next single-bot turn in ${label}...`);
+
+      setTimeout(async () => {
+        try {
+          await runWakeCheckSleepCycle();
+        } catch (err) {
+          console.warn("⚠️ [Scheduler] Cycle error:", err.message);
+        } finally {
+          scheduleNextTurn();
+        }
+      }, sleepMs);
+    }
 
     setTimeout(async () => {
-      await runWakeCheckSleepCycle();
-      scheduleNextTurn();
-    }, sleepMs);
+      try {
+        await runWakeCheckSleepCycle();
+      } finally {
+        scheduleNextTurn();
+      }
+    }, 6 * 1000);
+
+    const count = getWatcherSessionIds().length;
+    console.log(`🚀 Weekly Channel Auto-React Worker active (${count} Bot(s) | Auto-Scaled | Strict 1-Bot Online)`);
   }
 
-  setTimeout(async () => {
-    await runWakeCheckSleepCycle();
-    scheduleNextTurn();
-  }, 8 * 1000);
+  // ── 2-Minute Keep-Alive Ping (Prevents 10-Min Railway Sleep) ──
+  if (!keepAliveStarted) {
+    keepAliveStarted = true;
+    const TWO_MINS_MS = 2 * 60 * 1000;
+    const publicBase = (process.env.RAILWAY_PUBLIC_DOMAIN || "").trim();
+    const pingUrl = publicBase
+      ? `https://${publicBase.replace(/^https?:\/\//, "")}/api/react/ping`
+      : `http://127.0.0.1:${process.env.PORT || 8080}/api/react/ping`;
 
-  const count = getWatcherSessionIds().length;
-  console.log(`🚀 Weekly Channel Auto-React Worker active (${count} Bot(s) | Auto-Scaled | Strict 1-Bot Online)`);
+    setInterval(async () => {
+      try {
+        await fetch(pingUrl).catch(() => {});
+      } catch (_) {}
+    }, TWO_MINS_MS);
+
+    console.log(`💓 2-Minute Keep-Alive Ping active -> ${pingUrl}`);
+  }
 }
 
 export default router;
