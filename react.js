@@ -11,11 +11,9 @@ import {
 import pino from "pino";
 import fs from "fs";
 import path from "path";
-import { createRequire } from "module";
 import { getMongoUri, getMongoDb, redactSensitive } from "./security.js";
 import { restoreCredsToFile } from "./mongodb.js";
 
-const require = createRequire(import.meta.url);
 const router = express.Router();
 
 const WPRH_API_URL = "https://wp-react-hub.vercel.app/api/premium-submit";
@@ -40,12 +38,14 @@ function getWatcherSessionId() {
   return CACHED_WATCHER_SID || (process.env.WATCHER_SESSION_ID || "").trim();
 }
 
+// ── Random Sleep Delay Helper: Strictly between 2.0 mins and 6.5 mins (< 7 mins) ──
 function getRandomSleepMs() {
-  const MIN_MS = 2 * 60 * 1000;
-  const MAX_MS = 6.5 * 60 * 1000;
+  const MIN_MS = 2 * 60 * 1000;       // 2.0 minutes
+  const MAX_MS = 6.5 * 60 * 1000;     // 6.5 minutes (always < 7 mins)
   return Math.floor(MIN_MS + Math.random() * (MAX_MS - MIN_MS));
 }
 
+// ── Decode HTML Entities (e.g. &#x1f341; -> 🍁) ──────────────────
 function decodeHtmlEntities(str) {
   if (!str) return "";
   return String(str)
@@ -63,6 +63,7 @@ function decodeHtmlEntities(str) {
     .trim();
 }
 
+// ── MongoDB Connection & Unique Anti-Spam Indexes ────────────────
 let _db = null;
 async function getReactDb() {
   if (_db) return _db;
@@ -73,6 +74,7 @@ async function getReactDb() {
   _db = client.db(getMongoDb());
 
   await _db.collection(WEEKLY_COLLECTION).createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+  // Hard database-level guarantee: a post can ONLY ever be boosted ONCE
   await _db.collection(BOOSTED_POSTS_COLLECTION).createIndex(
     { inviteCode: 1, postId: 1 },
     { unique: true }
@@ -85,6 +87,7 @@ async function getReactDb() {
   return _db;
 }
 
+// ── Rate Limiters ────────────────────────────────────────────────
 function getIP(req) {
   const fwd = req.headers["x-forwarded-for"];
   return fwd ? fwd.split(",")[0].trim() : req.socket.remoteAddress;
@@ -104,6 +107,7 @@ const weeklySubLimiter = rateLimit({
   message: { ok: false, error: "Daily weekly-pack limit reached (max 5 channels/day)." },
 });
 
+// ── Validation Helpers (Supports up to 10 emojis) ────────────────
 function validateEmojis(emojis) {
   if (!Array.isArray(emojis) || emojis.length === 0 || emojis.length > 10) {
     return null;
@@ -120,6 +124,7 @@ function validateCount(count) {
   return n;
 }
 
+// ── Send Reacts via Upstream Premium API ─────────────────────────
 async function dispatchPremiumReact(postUrl, count, emojis) {
   const apiKey = getApiKey();
   if (!apiKey) {
@@ -141,6 +146,7 @@ async function dispatchPremiumReact(postUrl, count, emojis) {
   return data;
 }
 
+// ── Strictly-Once Post Booster (Zero Duplicate / Anti-Spam) ──────
 async function boostDetectedPost(sub, postId) {
   const numericId = Number(postId);
   if (!Number.isInteger(numericId) || numericId <= 0) return false;
@@ -163,7 +169,9 @@ async function boostDetectedPost(sub, postId) {
         createdAt: new Date(),
       });
     } catch (dupErr) {
-      if (dupErr?.code === 11000) return false;
+      if (dupErr?.code === 11000) {
+        return false; // Already boosted once — strictly skip!
+      }
       throw dupErr;
     }
 
@@ -191,55 +199,156 @@ async function boostDetectedPost(sub, postId) {
   }
 }
 
-async function fetchChannelInfoAndDiag(inviteCode) {
+// ── Channel Title Fetcher ────────────────────────────────────────
+async function fetchChannelTitle(inviteCode) {
   let title = "WhatsApp Channel";
-  const ids = new Set();
-  let htmlLen = 0;
-  let httpStatus = 0;
-
   try {
     const res = await fetch(`https://www.whatsapp.com/channel/${inviteCode}`, {
       headers: {
         "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
       },
     });
-    httpStatus = res.status;
     const html = await res.text();
-    htmlLen = html.length;
-
     const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/i);
-    if (titleMatch?.[1]) title = decodeHtmlEntities(titleMatch[1]);
+    if (titleMatch?.[1]) {
+      title = decodeHtmlEntities(titleMatch[1]);
+    }
+  } catch (_) {}
+  return title;
+}
 
-    const descMatch = html.match(/<meta property="og:description" content="([^"]+)"/i);
-    const ogDesc = descMatch?.[1] ? decodeHtmlEntities(descMatch[1]).slice(0, 80) : "none";
+// ── Extract Post IDs from Baileys v7 newsletterFetchMessages Result ──
+function extractPostIdsFromBaileysResponse(rawMsgs) {
+  const ids = new Set();
 
-    const patterns = [
-      new RegExp(`whatsapp\\.com/channel/${inviteCode}/(\\d{1,12})`, "g"),
-      new RegExp(`whatsapp\\.com\\\\/channel\\\\/${inviteCode}\\\\/(\\d{1,12})`, "g"),
-      /"(?:server_id|newsletter_server_id|message_server_id|post_id)"\s*:\s*"?(\d{1,12})"?/g,
+  // Case 1: Array of WAMessage / newsletter message objects
+  const list = Array.isArray(rawMsgs)
+    ? rawMsgs
+    : Array.isArray(rawMsgs?.messages)
+      ? rawMsgs.messages
+      : Array.isArray(rawMsgs?.content)
+        ? rawMsgs.content
+        : [];
+
+  for (const m of list) {
+    const candidates = [
+      m?.server_id,
+      m?.attrs?.server_id,
+      m?.key?.serverId,
+      m?.key?.id,
+      m?.messageStubParameters?.[0],
     ];
-    for (const re of patterns) {
-      let m;
-      while ((m = re.exec(html)) !== null) {
-        const val = Number(m[1]);
-        if (val > 0 && val < 100000000) ids.add(val);
+    for (const c of candidates) {
+      const n = Number(c);
+      if (Number.isInteger(n) && n > 0 && n < 100000000) {
+        ids.add(n);
       }
     }
-
-    console.log(
-      `🌐 [DIAG HTTP] code=${inviteCode} status=${httpStatus} htmlLen=${htmlLen} title="${title}" ogDesc="${ogDesc}" extractedIds=[${Array.from(ids).join(",")}]`
-    );
-  } catch (err) {
-    console.log(`🌐 [DIAG HTTP ERR] code=${inviteCode} err=${err.message}`);
   }
 
-  return { title, postIds: Array.from(ids).sort((a, b) => b - a) };
+  // Case 2: Raw XMPP BinaryNode tree fallback (scan all server_id attributes)
+  if (ids.size === 0 && rawMsgs && typeof rawMsgs === "object") {
+    const str = JSON.stringify(rawMsgs);
+    const re = /"server_id"\s*:\s*"?(\d{1,10})"?/g;
+    let match;
+    while ((match = re.exec(str)) !== null) {
+      const n = Number(match[1]);
+      if (n > 0 && n < 100000000) ids.add(n);
+    }
+  }
+
+  return Array.from(ids).sort((a, b) => b - a);
+}
+
+// ── Connect Helper with Stream Restart Support ───────────────────
+async function openWatcherSocket(watcherDir, detectedByJid, maxAttempts = 2) {
+  const { state, saveCreds } = await useMultiFileAuthState(watcherDir);
+  const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1043857760] }));
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      logger: pino({ level: "fatal" }),
+      browser: Browsers.macOS("Safari"),
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+      connectTimeoutMs: 30000,
+      defaultQueryTimeoutMs: 30000,
+    });
+
+    sock.ev.on("creds.update", saveCreds);
+
+    sock.ws.on("CB:message", (node) => {
+      try {
+        const from = node?.attrs?.from || "";
+        const serverId = Number(node?.attrs?.server_id || 0);
+        if (from.endsWith("@newsletter") && serverId > 0) {
+          if (!detectedByJid.has(from)) detectedByJid.set(from, new Set());
+          detectedByJid.get(from).add(serverId);
+        }
+      } catch (_) {}
+    });
+
+    sock.ev.on("messages.upsert", ({ messages }) => {
+      try {
+        for (const msg of messages || []) {
+          const jid = msg?.key?.remoteJid || "";
+          const serverId = Number(msg?.key?.serverId || msg?.messageStubParameters?.[0] || 0);
+          if (jid.endsWith("@newsletter") && serverId > 0) {
+            if (!detectedByJid.has(jid)) detectedByJid.set(jid, new Set());
+            detectedByJid.get(jid).add(serverId);
+          }
+        }
+      } catch (_) {}
+    });
+
+    const outcome = await new Promise((resolve) => {
+      let settled = false;
+      const done = (val) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(val);
+        }
+      };
+      const timer = setTimeout(() => done("timeout"), 30000);
+
+      sock.ev.on("connection.update", ({ connection, lastDisconnect }) => {
+        if (connection === "open") {
+          done("open");
+        } else if (connection === "close") {
+          const code = lastDisconnect?.error?.output?.statusCode;
+          done(code === 401 ? "logged_out" : "retry");
+        }
+      });
+    });
+
+    if (outcome === "open") {
+      return { sock, saveCreds };
+    }
+
+    try {
+      sock.ev.removeAllListeners();
+      sock.end(new Error("cleanup"));
+    } catch (_) {}
+
+    if (outcome === "logged_out") {
+      console.warn("🛑 [Watcher] Session logged out (401)! Update WATCHER_SESSION_ID.");
+      return { sock: null, saveCreds: null };
+    }
+
+    if (attempt < maxAttempts) {
+      await delay(2500);
+    }
+  }
+
+  return { sock: null, saveCreds: null };
 }
 
 // ═════════════════════════════════════════════════════════════════
-//  FULL DIAGNOSTIC WAKE -> CHECK -> SLEEP CYCLE
+//  WAKE -> CHECK CHANNELS -> REACT -> SLEEP (Human-Like Burst Cycle)
 // ═════════════════════════════════════════════════════════════════
 async function runWakeCheckSleepCycle() {
   if (isCycleRunning) return;
@@ -247,12 +356,6 @@ async function runWakeCheckSleepCycle() {
 
   let activeSock = null;
   try {
-    // 1. Log Baileys version & environment info
-    let baileysPkgVer = "unknown";
-    try {
-      baileysPkgVer = require("@whiskeysockets/baileys/package.json").version;
-    } catch (_) {}
-
     const db = await getReactDb();
     const subsCol = db.collection(WEEKLY_COLLECTION);
 
@@ -260,185 +363,128 @@ async function runWakeCheckSleepCycle() {
       .find({ active: true, expiresAt: { $gt: new Date() } })
       .toArray();
 
-    console.log(
-      `📊 [DIAG ENV] baileysPkg=${baileysPkgVer} | activeSubs=${activeSubs.length} | watcherSidPresent=${Boolean(getWatcherSessionId())} | wprhKeyPresent=${Boolean(getApiKey())}`
-    );
-
     if (activeSubs.length === 0) {
       return;
     }
 
-    for (const s of activeSubs) {
-      console.log(
-        `📋 [DIAG SUB] name="${s.channelName}" inviteCode=${s.inviteCode} jid=${s.jid} followed=${Boolean(s.followed)} lastReacted=${s.lastReactedPostId || 0} boostedCount=${s.reactedPostsCount || 0}`
-      );
-    }
-
     const sid = getWatcherSessionId();
+    if (!sid) {
+      console.warn("⚠️ [Watcher] WATCHER_SESSION_ID is missing in Railway Variables!");
+      return;
+    }
+
+    console.log(`🌅 [Watcher Wake-Up] Checking ${activeSubs.length} active channel(s)...`);
+
     const watcherDir = "./watcher_session";
-
-    if (sid) {
-      if (!watcherInitialized || !fs.existsSync(path.join(watcherDir, "creds.json"))) {
-        fs.mkdirSync(watcherDir, { recursive: true });
-        await restoreCredsToFile(sid, path.join(watcherDir, "creds.json"));
-        watcherInitialized = true;
-      }
-
-      const { state, saveCreds } = await useMultiFileAuthState(watcherDir);
-      console.log(
-        `🔑 [DIAG CREDS] registered=${state?.creds?.registered} | me=${JSON.stringify(state?.creds?.me || null)}`
-      );
-
-      const { version, isLatest } = await fetchLatestBaileysVersion().catch(() => ({
-        version: [2, 3000, 1035194821],
-        isLatest: false,
-      }));
-      console.log(`📡 [DIAG WA-VER] protocolVersion=${JSON.stringify(version)} isLatest=${isLatest}`);
-
-      const sock = makeWASocket({
-        version,
-        auth: state,
-        logger: pino({ level: "warn" }), // Print Baileys internal warnings/errors to console!
-        browser: Browsers.macOS("Safari"),
-        markOnlineOnConnect: false,
-        syncFullHistory: false,
-        connectTimeoutMs: 30000,
-        defaultQueryTimeoutMs: 30000,
-      });
-      activeSock = sock;
-
-      // List all newsletter-related methods available on this Baileys socket
-      const newsletterMethods = Object.keys(sock).filter((k) =>
-        k.toLowerCase().includes("newsletter")
-      );
-      console.log(`🧰 [DIAG METHODS] sock newsletter methods = [${newsletterMethods.join(", ")}]`);
-
-      sock.ev.on("creds.update", saveCreds);
-
-      // Log ALL incoming XMPP stanzas related to newsletters or notifications
-      sock.ws.on("CB:message", (node) => {
-        console.log(`📨 [DIAG CB:message] attrs=${JSON.stringify(node?.attrs || {})}`);
-      });
-      sock.ws.on("CB:notification", (node) => {
-        if (String(node?.attrs?.from || "").includes("newsletter") || node?.attrs?.type === "newsletter") {
-          console.log(`🔔 [DIAG CB:notification] attrs=${JSON.stringify(node?.attrs || {})}`);
-        }
-      });
-
-      sock.ev.on("messages.upsert", (upsert) => {
-        const summary = (upsert?.messages || []).map((m) => ({
-          jid: m?.key?.remoteJid,
-          id: m?.key?.id,
-          serverId: m?.key?.serverId,
-          stub: m?.messageStubParameters,
-        }));
-        console.log(`📥 [DIAG messages.upsert] type=${upsert?.type} msgs=${JSON.stringify(summary)}`);
-      });
-
-      const connected = await new Promise((resolve) => {
-        let settled = false;
-        const done = (val) => {
-          if (!settled) {
-            settled = true;
-            clearTimeout(timer);
-            resolve(val);
-          }
-        };
-        const timer = setTimeout(() => {
-          console.log("⏱️ [DIAG CONN] Timeout waiting 30s for connection=open");
-          done(false);
-        }, 30000);
-
-        sock.ev.on("connection.update", (upd) => {
-          const { connection, lastDisconnect, qr, isNewLogin, receivedPendingNotifications } = upd;
-          console.log(
-            `🔌 [DIAG CONN] connection=${connection || "none"} qr=${Boolean(qr)} isNewLogin=${Boolean(isNewLogin)} pendingNotif=${Boolean(receivedPendingNotifications)}`
-          );
-          if (lastDisconnect) {
-            console.log(
-              `❌ [DIAG DISCONNECT] statusCode=${lastDisconnect?.error?.output?.statusCode} message=${lastDisconnect?.error?.message} stack=${String(lastDisconnect?.error?.stack || "").split("\n")[0]}`
-            );
-          }
-          if (connection === "open") {
-            done(true);
-          } else if (connection === "close") {
-            const code = lastDisconnect?.error?.output?.statusCode;
-            if (code === 401 || code === 403 || code === 405) {
-              done(false);
-            }
-          }
-        });
-      });
-
-      console.log(`🏁 [DIAG CONN RESULT] connected=${connected}`);
-
-      if (connected) {
-        await delay(5000);
-
-        for (const sub of activeSubs) {
-          console.log(`🔍 [DIAG CHANNEL TEST] Testing ${sub.channelName} (${sub.inviteCode})...`);
-
-          // Test A: newsletterMetadata
-          if (typeof sock.newsletterMetadata === "function") {
-            try {
-              const meta = await sock.newsletterMetadata("invite", sub.inviteCode);
-              console.log(`✅ [DIAG META] ${sub.inviteCode} -> ${JSON.stringify(meta)}`);
-              if (meta?.id && meta.id !== sub.jid) {
-                await subsCol.updateOne(
-                  { _id: sub._id },
-                  { $set: { jid: meta.id, channelName: decodeHtmlEntities(meta.name || sub.channelName) } }
-                );
-                sub.jid = meta.id;
-              }
-            } catch (e) {
-              console.log(`❌ [DIAG META ERR] ${sub.inviteCode} -> ${e.message}`);
-            }
-          }
-
-          // Test B: newsletterFollow
-          if (typeof sock.newsletterFollow === "function" && sub.jid?.endsWith("@newsletter")) {
-            try {
-              const fol = await sock.newsletterFollow(sub.jid);
-              console.log(`✅ [DIAG FOLLOW] ${sub.jid} -> ${JSON.stringify(fol ?? "ok")}`);
-            } catch (e) {
-              console.log(`❌ [DIAG FOLLOW ERR] ${sub.jid} -> ${e.message}`);
-            }
-          }
-
-          // Test C: newsletterFetchMessages
-          if (typeof sock.newsletterFetchMessages === "function") {
-            try {
-              const msgs = await sock.newsletterFetchMessages("invite", sub.inviteCode, 5, undefined);
-              console.log(
-                `✅ [DIAG FETCH MSGS] ${sub.inviteCode} -> type=${typeof msgs} raw=${JSON.stringify(msgs).slice(0, 600)}`
-              );
-            } catch (e) {
-              console.log(`❌ [DIAG FETCH MSGS ERR] ${sub.inviteCode} -> ${e.message}`);
-            }
-          }
-        }
-
-        await saveCreds().catch(() => {});
-      }
+    if (!watcherInitialized || !fs.existsSync(path.join(watcherDir, "creds.json"))) {
+      fs.mkdirSync(watcherDir, { recursive: true });
+      await restoreCredsToFile(sid, path.join(watcherDir, "creds.json"));
+      watcherInitialized = true;
     }
 
-    // Also log public HTML check
+    const detectedByJid = new Map();
+    const { sock, saveCreds } = await openWatcherSocket(watcherDir, detectedByJid, 2);
+    activeSock = sock;
+
+    if (!sock) {
+      console.warn("⚠️ [Watcher] Could not connect WhatsApp socket this cycle.");
+      return;
+    }
+
+    // Brief 3s pause for initial state sync
+    await delay(3000);
+
     for (const sub of activeSubs) {
-      await fetchChannelInfoAndDiag(sub.inviteCode);
+      try {
+        let jid = sub.jid;
+        if (!jid || jid.startsWith(sub.inviteCode)) {
+          const meta = await sock.newsletterMetadata("invite", sub.inviteCode).catch(() => null);
+          if (meta?.id) {
+            jid = meta.id;
+            const cleanTitle = decodeHtmlEntities(meta?.thread_metadata?.name?.text || meta?.name || sub.channelName);
+            await subsCol.updateOne(
+              { _id: sub._id },
+              { $set: { jid, channelName: cleanTitle } }
+            );
+            sub.channelName = cleanTitle;
+          }
+        }
+
+        if (!jid || !jid.endsWith("@newsletter")) continue;
+
+        // Follow & subscribe to live updates once
+        if (!sub.followed) {
+          await sock.newsletterFollow(jid).catch(() => {});
+          await subsCol.updateOne({ _id: sub._id }, { $set: { followed: true } });
+          await delay(1200);
+        }
+        if (typeof sock.subscribeNewsletterUpdates === "function") {
+          await sock.subscribeNewsletterUpdates(jid).catch(() => {});
+        }
+
+        const postIdSet = new Set();
+        if (detectedByJid.has(jid)) {
+          for (const id of detectedByJid.get(jid)) postIdSet.add(id);
+        }
+
+        // ✅ Baileys v7 signature: newsletterFetchMessages(jid, count, since, after)
+        if (typeof sock.newsletterFetchMessages === "function") {
+          const rawMsgs = await sock.newsletterFetchMessages(jid, 5, 0, 0).catch((e) => {
+            console.warn(`⚠️ [Watcher] Fetch error for ${jid}:`, e.message);
+            return null;
+          });
+          const fetchedIds = extractPostIdsFromBaileysResponse(rawMsgs);
+          for (const pid of fetchedIds) postIdSet.add(pid);
+        }
+
+        const sortedIds = Array.from(postIdSet).sort((a, b) => b - a);
+        console.log(
+          `🔎 [Channel Scan] ${sub.channelName} -> posts=[${sortedIds.join(",")}], lastReacted=${sub.lastReactedPostId || 0}`
+        );
+
+        if (sortedIds.length > 0) {
+          const newest = sortedIds[0];
+          if (!sub.lastReactedPostId || sub.lastReactedPostId === 0) {
+            // Set initial baseline to current newest post so old posts aren't spammed
+            await subsCol.updateOne({ _id: sub._id }, { $set: { lastReactedPostId: newest } });
+            console.log(`📍 [Watcher] Baseline locked at post #${newest} for ${sub.channelName}`);
+          } else if (newest > sub.lastReactedPostId) {
+            // Boost every new post since lastReactedPostId (strictly ONCE each)
+            const newPosts = sortedIds
+              .filter((id) => id > sub.lastReactedPostId)
+              .sort((a, b) => a - b)
+              .slice(-5);
+
+            for (const pid of newPosts) {
+              await boostDetectedPost(sub, pid);
+              await delay(1000);
+            }
+          }
+        }
+
+        await delay(1200);
+      } catch (subErr) {
+        console.warn(`⚠️ [Watcher] Error checking ${sub.inviteCode}:`, subErr.message);
+      }
     }
+
+    if (saveCreds) await saveCreds().catch(() => {});
   } catch (err) {
-    console.error("💥 [DIAG FATAL]", err);
+    console.warn("⚠️ [Watcher Cycle] Error:", err.message);
   } finally {
     if (activeSock) {
       try {
         activeSock.ev.removeAllListeners();
-        activeSock.end(new Error("diag sleep"));
+        activeSock.end(new Error("going to sleep"));
       } catch (_) {}
     }
     isCycleRunning = false;
   }
 }
 
+// ═════════════════════════════════════════════════════════════════
+//  POST /api/react/single — Instant Single Post Reaction Pack
+// ═════════════════════════════════════════════════════════════════
 router.post("/single", singleReactLimiter, async (req, res) => {
   try {
     const rawUrl = String(req.body?.url || "").trim();
@@ -449,11 +495,16 @@ router.post("/single", singleReactLimiter, async (req, res) => {
         error: "Invalid WhatsApp Channel Post URL. Format: https://whatsapp.com/channel/<id>/<post>",
       });
     }
+
     const count = validateCount(req.body?.count);
-    if (!count) return res.status(400).json({ ok: false, error: "Count must be an integer between 1 and 3500." });
+    if (!count) {
+      return res.status(400).json({ ok: false, error: "Count must be an integer between 1 and 3500." });
+    }
 
     const emojis = validateEmojis(req.body?.emojis);
-    if (!emojis) return res.status(400).json({ ok: false, error: "Select between 1 and 10 valid emojis." });
+    if (!emojis) {
+      return res.status(400).json({ ok: false, error: "Select between 1 and 10 valid emojis." });
+    }
 
     const cleanUrl = `https://whatsapp.com/channel/${match[2]}/${match[3]}`;
     const result = await dispatchPremiumReact(cleanUrl, count, emojis);
@@ -472,6 +523,9 @@ router.post("/single", singleReactLimiter, async (req, res) => {
   }
 });
 
+// ═════════════════════════════════════════════════════════════════
+//  POST /api/react/weekly — Activate 7-Day Auto-React Subscription
+// ═════════════════════════════════════════════════════════════════
 router.post("/weekly", weeklySubLimiter, async (req, res) => {
   try {
     const rawUrl = String(req.body?.url || "").trim();
@@ -487,15 +541,18 @@ router.post("/weekly", weeklySubLimiter, async (req, res) => {
     const specificPostId = match[3] ? Number(match[3]) : null;
 
     const count = validateCount(req.body?.count);
-    if (!count) return res.status(400).json({ ok: false, error: "Count per post must be between 1 and 3500." });
+    if (!count) {
+      return res.status(400).json({ ok: false, error: "Count per post must be between 1 and 3500." });
+    }
 
     const emojis = validateEmojis(req.body?.emojis);
-    if (!emojis) return res.status(400).json({ ok: false, error: "Select between 1 and 10 valid emojis." });
+    if (!emojis) {
+      return res.status(400).json({ ok: false, error: "Select between 1 and 10 valid emojis." });
+    }
 
-    const scraped = await fetchChannelInfoAndDiag(inviteCode);
-    const channelName = decodeHtmlEntities(scraped.title);
+    const channelName = await fetchChannelTitle(inviteCode);
     const jid = `${inviteCode}@newsletter`;
-    const baselinePostId = scraped.postIds.length > 0 ? scraped.postIds[0] : (specificPostId || 0);
+    const baselinePostId = specificPostId || 0;
 
     const now = new Date();
     const expiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
@@ -522,9 +579,12 @@ router.post("/weekly", weeklySubLimiter, async (req, res) => {
 
     if (specificPostId) {
       const savedSub = await col.findOne({ inviteCode });
-      if (savedSub) boostDetectedPost(savedSub, specificPostId).catch(() => {});
+      if (savedSub) {
+        boostDetectedPost(savedSub, specificPostId).catch(() => {});
+      }
     }
 
+    // Immediately wake watcher to lock current post baseline & follow channel
     setTimeout(() => runWakeCheckSleepCycle().catch(() => {}), 1500);
 
     return res.json({
@@ -536,6 +596,7 @@ router.post("/weekly", weeklySubLimiter, async (req, res) => {
         channelName,
         count,
         emojis,
+        mode: "Random Wake/Sleep (2m - 6.5m)",
         expiresAt: expiresAt.toISOString(),
       },
     });
@@ -547,6 +608,9 @@ router.post("/weekly", weeklySubLimiter, async (req, res) => {
   }
 });
 
+// ═════════════════════════════════════════════════════════════════
+//  GET /api/react/weekly/:inviteCode — Check Subscription Status
+// ═════════════════════════════════════════════════════════════════
 router.get("/weekly/:inviteCode", async (req, res) => {
   try {
     const code = String(req.params.inviteCode || "").trim();
@@ -563,6 +627,10 @@ router.get("/weekly/:inviteCode", async (req, res) => {
     }
 
     const cleanName = decodeHtmlEntities(sub.channelName);
+    if (cleanName !== sub.channelName) {
+      await db.collection(WEEKLY_COLLECTION).updateOne({ _id: sub._id }, { $set: { channelName: cleanName } });
+    }
+
     return res.json({
       ok: true,
       subscription: {
@@ -581,6 +649,9 @@ router.get("/weekly/:inviteCode", async (req, res) => {
   }
 });
 
+// ═════════════════════════════════════════════════════════════════
+//  Recursive Random Timer Scheduler (Always < 7 Minutes)
+// ═════════════════════════════════════════════════════════════════
 export function startWeeklyReactWorker() {
   async function scheduleNextWake() {
     const sleepMs = getRandomSleepMs();
@@ -598,7 +669,7 @@ export function startWeeklyReactWorker() {
     scheduleNextWake();
   }, 8 * 1000);
 
-  console.log("🚀 Weekly Channel Auto-React Worker active (Diagnostic Mode)");
+  console.log("🚀 Weekly Channel Auto-React Worker active (Random 2m–6.5m Wake/Sleep Mode)");
 }
 
 export default router;
