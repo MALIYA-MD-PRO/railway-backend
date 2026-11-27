@@ -218,11 +218,10 @@ async function fetchChannelTitle(inviteCode) {
   return title;
 }
 
-// ── Extract Post IDs from Baileys v7 newsletterFetchMessages Result ──
+// ── Extract All Post IDs from Baileys v7 newsletterFetchMessages Result ──
 function extractPostIdsFromBaileysResponse(rawMsgs) {
   const ids = new Set();
 
-  // Case 1: Array of WAMessage / newsletter message objects
   const list = Array.isArray(rawMsgs)
     ? rawMsgs
     : Array.isArray(rawMsgs?.messages)
@@ -247,8 +246,8 @@ function extractPostIdsFromBaileysResponse(rawMsgs) {
     }
   }
 
-  // Case 2: Raw XMPP BinaryNode tree fallback (scan all server_id attributes)
-  if (ids.size === 0 && rawMsgs && typeof rawMsgs === "object") {
+  // Deep scan raw XMPP node structure for any server_id attributes
+  if (rawMsgs && typeof rawMsgs === "object") {
     const str = JSON.stringify(rawMsgs);
     const re = /"server_id"\s*:\s*"?(\d{1,10})"?/g;
     let match;
@@ -391,8 +390,8 @@ async function runWakeCheckSleepCycle() {
       return;
     }
 
-    // Brief 3s pause for initial state sync
-    await delay(3000);
+    // Hold open 4.5s so any pushed channel messages flush in
+    await delay(4500);
 
     for (const sub of activeSubs) {
       try {
@@ -412,7 +411,6 @@ async function runWakeCheckSleepCycle() {
 
         if (!jid || !jid.endsWith("@newsletter")) continue;
 
-        // Follow & subscribe to live updates once
         if (!sub.followed) {
           await sock.newsletterFollow(jid).catch(() => {});
           await subsCol.updateOne({ _id: sub._id }, { $set: { followed: true } });
@@ -427,9 +425,9 @@ async function runWakeCheckSleepCycle() {
           for (const id of detectedByJid.get(jid)) postIdSet.add(id);
         }
 
-        // ✅ Baileys v7 signature: newsletterFetchMessages(jid, count, since, after)
+        // ✅ Pass undefined for since/after so Baileys v7 returns the latest 10 posts instead of just 1
         if (typeof sock.newsletterFetchMessages === "function") {
-          const rawMsgs = await sock.newsletterFetchMessages(jid, 5, 0, 0).catch((e) => {
+          const rawMsgs = await sock.newsletterFetchMessages(jid, 10, undefined, undefined).catch((e) => {
             console.warn(`⚠️ [Watcher] Fetch error for ${jid}:`, e.message);
             return null;
           });
@@ -444,25 +442,30 @@ async function runWakeCheckSleepCycle() {
 
         if (sortedIds.length > 0) {
           const newest = sortedIds[0];
-          if (!sub.lastReactedPostId || sub.lastReactedPostId === 0) {
-            // Set initial baseline to current newest post so old posts aren't spammed
+          const prevLast = Number(sub.lastReactedPostId || 0);
+
+          if (prevLast === 0) {
+            // Set initial baseline so existing old posts are not spammed
             await subsCol.updateOne({ _id: sub._id }, { $set: { lastReactedPostId: newest } });
             console.log(`📍 [Watcher] Baseline locked at post #${newest} for ${sub.channelName}`);
-          } else if (newest > sub.lastReactedPostId) {
-            // Boost every new post since lastReactedPostId (strictly ONCE each)
-            const newPosts = sortedIds
-              .filter((id) => id > sub.lastReactedPostId)
-              .sort((a, b) => a - b)
-              .slice(-5);
+          } else if (newest > prevLast) {
+            // Fill any sequential post IDs between prevLast+1 and newest (up to 6 posts)
+            // Unique DB index ensures already-boosted posts are skipped automatically
+            const candidateSet = new Set(sortedIds.filter((id) => id > prevLast));
+            const startFill = Math.max(prevLast + 1, newest - 5);
+            for (let id = startFill; id <= newest; id++) {
+              candidateSet.add(id);
+            }
 
-            for (const pid of newPosts) {
+            const toBoost = Array.from(candidateSet).sort((a, b) => a - b).slice(-6);
+            for (const pid of toBoost) {
               await boostDetectedPost(sub, pid);
-              await delay(1000);
+              await delay(1200);
             }
           }
         }
 
-        await delay(1200);
+        await delay(1000);
       } catch (subErr) {
         console.warn(`⚠️ [Watcher] Error checking ${sub.inviteCode}:`, subErr.message);
       }
@@ -551,31 +554,40 @@ router.post("/weekly", weeklySubLimiter, async (req, res) => {
     }
 
     const channelName = await fetchChannelTitle(inviteCode);
-    const jid = `${inviteCode}@newsletter`;
-    const baselinePostId = specificPostId || 0;
-
     const now = new Date();
     const expiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
 
     const db = await getReactDb();
     const col = db.collection(WEEKLY_COLLECTION);
 
+    // Preserve existing baseline & JID if channel was already registered
+    const existing = await col.findOne({ inviteCode });
+    const preservedBaseline = existing?.lastReactedPostId || specificPostId || 0;
+    const preservedJid = existing?.jid || `${inviteCode}@newsletter`;
+    const preservedFollowed = Boolean(existing?.followed);
+
     const subDoc = {
       inviteCode,
-      jid,
+      jid: preservedJid,
       channelName,
       count,
       emojis,
-      followed: false,
-      lastReactedPostId: baselinePostId,
-      reactedPostsCount: 0,
+      followed: preservedFollowed,
+      lastReactedPostId: preservedBaseline,
       active: true,
-      createdAt: now,
+      updatedAt: now,
       expiresAt,
       ownerIp: getIP(req),
     };
 
-    await col.updateOne({ inviteCode }, { $set: subDoc }, { upsert: true });
+    await col.updateOne(
+      { inviteCode },
+      {
+        $set: subDoc,
+        $setOnInsert: { createdAt: now, reactedPostsCount: 0 },
+      },
+      { upsert: true }
+    );
 
     if (specificPostId) {
       const savedSub = await col.findOne({ inviteCode });
@@ -584,15 +596,15 @@ router.post("/weekly", weeklySubLimiter, async (req, res) => {
       }
     }
 
-    // Immediately wake watcher to lock current post baseline & follow channel
-    setTimeout(() => runWakeCheckSleepCycle().catch(() => {}), 1500);
+    // Wake watcher after 2s to resolve JID & lock baseline if new
+    setTimeout(() => runWakeCheckSleepCycle().catch(() => {}), 2000);
 
     return res.json({
       ok: true,
       message: "Weekly Auto-React Pack activated for 7 days!",
       subscription: {
         inviteCode,
-        jid,
+        jid: preservedJid,
         channelName,
         count,
         emojis,
