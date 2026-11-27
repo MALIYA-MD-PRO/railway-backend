@@ -18,7 +18,11 @@ const router = express.Router();
 
 const WPRH_API_URL = "https://wp-react-hub.vercel.app/api/premium-submit";
 const CACHED_WPRH_KEY = process.env.WPRH_API_KEY || "";
-const CACHED_WATCHER_SID = (process.env.WATCHER_SESSION_ID || "").trim();
+const CACHED_WATCHER_SIDS = (
+  process.env.WATCHER_SESSION_IDS ||
+  process.env.WATCHER_SESSION_ID ||
+  ""
+).trim();
 
 const WEEKLY_COLLECTION = "weekly_react_subs";
 const BOOSTED_POSTS_COLLECTION = "boosted_channel_posts";
@@ -28,24 +32,48 @@ const CHANNEL_ONLY_RE = /^https?:\/\/(www\.)?whatsapp\.com\/channel\/([A-Za-z0-9
 
 const inFlightPosts = new Set();
 let isCycleRunning = false;
-let watcherInitialized = false;
+let currentlyOnlineSlot = null; // Guarantees strictly ONE bot online at any instant
+let watcherTurnIndex = 0;
+const initializedWatchers = new Set();
+const deadWatchers = new Set();
 
 function getApiKey() {
   return CACHED_WPRH_KEY || process.env.WPRH_API_KEY || "";
 }
 
-function getWatcherSessionId() {
-  return CACHED_WATCHER_SID || (process.env.WATCHER_SESSION_ID || "").trim();
+function getWatcherSessionIds() {
+  const raw =
+    CACHED_WATCHER_SIDS ||
+    (process.env.WATCHER_SESSION_IDS || process.env.WATCHER_SESSION_ID || "").trim();
+  return raw
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
-// ── Random Sleep Delay Helper: Strictly between 2.0 mins and 6.5 mins (< 7 mins) ──
-function getRandomSleepMs() {
-  const MIN_MS = 2 * 60 * 1000;       // 2.0 minutes
-  const MAX_MS = 6.5 * 60 * 1000;     // 6.5 minutes (always < 7 mins)
-  return Math.floor(MIN_MS + Math.random() * (MAX_MS - MIN_MS));
+function getAliveWatcherCount() {
+  const all = getWatcherSessionIds();
+  const alive = all.filter((_, idx) => !deadWatchers.has(idx));
+  return Math.max(1, alive.length || all.length);
 }
 
-// ── Decode HTML Entities (e.g. &#x1f341; -> 🍁) ──────────────────
+// ── Proportional Sleep Delay Based on Added Sessions Count ───────
+// Base single-bot window: 2.0 mins (120s) to 6.5 mins (390s)
+// Divided equally by N sessions so each individual bot still rests 2.0m - 6.5m!
+//  - 1 session  -> 2.0m – 6.5m
+//  - 2 sessions -> 1.0m – 3.25m
+//  - 4 sessions -> 30s  – 97s
+//  - 10 sessions -> 12s – 39s
+function getScaledSleepMs() {
+  const n = getAliveWatcherCount();
+  const BASE_MIN_MS = 2 * 60 * 1000;
+  const BASE_MAX_MS = 6.5 * 60 * 1000;
+
+  const scaledMin = Math.max(10 * 1000, Math.floor(BASE_MIN_MS / n));
+  const scaledMax = Math.max(25 * 1000, Math.floor(BASE_MAX_MS / n));
+  return Math.floor(scaledMin + Math.random() * (scaledMax - scaledMin));
+}
+
 function decodeHtmlEntities(str) {
   if (!str) return "";
   return String(str)
@@ -63,7 +91,6 @@ function decodeHtmlEntities(str) {
     .trim();
 }
 
-// ── MongoDB Connection & Unique Anti-Spam Indexes ────────────────
 let _db = null;
 async function getReactDb() {
   if (_db) return _db;
@@ -74,7 +101,6 @@ async function getReactDb() {
   _db = client.db(getMongoDb());
 
   await _db.collection(WEEKLY_COLLECTION).createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
-  // Hard database-level guarantee: a post can ONLY ever be boosted ONCE
   await _db.collection(BOOSTED_POSTS_COLLECTION).createIndex(
     { inviteCode: 1, postId: 1 },
     { unique: true }
@@ -87,7 +113,6 @@ async function getReactDb() {
   return _db;
 }
 
-// ── Rate Limiters ────────────────────────────────────────────────
 function getIP(req) {
   const fwd = req.headers["x-forwarded-for"];
   return fwd ? fwd.split(",")[0].trim() : req.socket.remoteAddress;
@@ -107,7 +132,6 @@ const weeklySubLimiter = rateLimit({
   message: { ok: false, error: "Daily weekly-pack limit reached (max 5 channels/day)." },
 });
 
-// ── Validation Helpers (Supports up to 10 emojis) ────────────────
 function validateEmojis(emojis) {
   if (!Array.isArray(emojis) || emojis.length === 0 || emojis.length > 10) {
     return null;
@@ -124,7 +148,6 @@ function validateCount(count) {
   return n;
 }
 
-// ── Send Reacts via Upstream Premium API ─────────────────────────
 async function dispatchPremiumReact(postUrl, count, emojis) {
   const apiKey = getApiKey();
   if (!apiKey) {
@@ -146,7 +169,6 @@ async function dispatchPremiumReact(postUrl, count, emojis) {
   return data;
 }
 
-// ── Strictly-Once Post Booster (Zero Duplicate / Anti-Spam) ──────
 async function boostDetectedPost(sub, postId) {
   const numericId = Number(postId);
   if (!Number.isInteger(numericId) || numericId <= 0) return false;
@@ -170,7 +192,7 @@ async function boostDetectedPost(sub, postId) {
       });
     } catch (dupErr) {
       if (dupErr?.code === 11000) {
-        return false; // Already boosted once — strictly skip!
+        return false;
       }
       throw dupErr;
     }
@@ -199,7 +221,6 @@ async function boostDetectedPost(sub, postId) {
   }
 }
 
-// ── Channel Title Fetcher ────────────────────────────────────────
 async function fetchChannelTitle(inviteCode) {
   let title = "WhatsApp Channel";
   try {
@@ -218,7 +239,6 @@ async function fetchChannelTitle(inviteCode) {
   return title;
 }
 
-// ── Extract All Post IDs from Baileys v7 newsletterFetchMessages Result ──
 function extractPostIdsFromBaileysResponse(rawMsgs) {
   const ids = new Set();
 
@@ -246,7 +266,6 @@ function extractPostIdsFromBaileysResponse(rawMsgs) {
     }
   }
 
-  // Deep scan raw XMPP node structure for any server_id attributes
   if (rawMsgs && typeof rawMsgs === "object") {
     const str = JSON.stringify(rawMsgs);
     const re = /"server_id"\s*:\s*"?(\d{1,10})"?/g;
@@ -260,8 +279,7 @@ function extractPostIdsFromBaileysResponse(rawMsgs) {
   return Array.from(ids).sort((a, b) => b - a);
 }
 
-// ── Connect Helper with Stream Restart Support ───────────────────
-async function openWatcherSocket(watcherDir, detectedByJid, maxAttempts = 2) {
+async function openWatcherSocket(watcherDir, detectedByJid, botLabel, slotIndex, maxAttempts = 2) {
   const { state, saveCreds } = await useMultiFileAuthState(watcherDir);
   const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1043857760] }));
 
@@ -334,7 +352,8 @@ async function openWatcherSocket(watcherDir, detectedByJid, maxAttempts = 2) {
     } catch (_) {}
 
     if (outcome === "logged_out") {
-      console.warn("🛑 [Watcher] Session logged out (401)! Update WATCHER_SESSION_ID.");
+      deadWatchers.add(slotIndex);
+      console.warn(`🛑 [${botLabel}] Logged out (401) — marked inactive and auto-skipped.`);
       return { sock: null, saveCreds: null };
     }
 
@@ -347,13 +366,15 @@ async function openWatcherSocket(watcherDir, detectedByJid, maxAttempts = 2) {
 }
 
 // ═════════════════════════════════════════════════════════════════
-//  WAKE -> CHECK CHANNELS -> REACT -> SLEEP (Human-Like Burst Cycle)
+//  STRICT SINGLE-ACTIVE-BOT TURN CYCLE (Never 2 Bots Online Together)
 // ═════════════════════════════════════════════════════════════════
 async function runWakeCheckSleepCycle() {
-  if (isCycleRunning) return;
+  // Hard mutex: if ANY bot is already online or waking up, abort immediately
+  if (isCycleRunning || currentlyOnlineSlot !== null) return;
   isCycleRunning = true;
 
   let activeSock = null;
+  let botLabel = "Watcher";
   try {
     const db = await getReactDb();
     const subsCol = db.collection(WEEKLY_COLLECTION);
@@ -366,32 +387,49 @@ async function runWakeCheckSleepCycle() {
       return;
     }
 
-    const sid = getWatcherSessionId();
-    if (!sid) {
-      console.warn("⚠️ [Watcher] WATCHER_SESSION_ID is missing in Railway Variables!");
+    const sids = getWatcherSessionIds();
+    if (sids.length === 0) {
+      console.warn("⚠️ [Watcher] WATCHER_SESSION_IDS / WATCHER_SESSION_ID not set!");
       return;
     }
 
-    console.log(`🌅 [Watcher Wake-Up] Checking ${activeSubs.length} active channel(s)...`);
+    if (deadWatchers.size >= sids.length) {
+      deadWatchers.clear();
+    }
+    let slot = watcherTurnIndex % sids.length;
+    for (let i = 0; i < sids.length; i++) {
+      const candidate = (watcherTurnIndex + i) % sids.length;
+      if (!deadWatchers.has(candidate)) {
+        slot = candidate;
+        watcherTurnIndex = candidate + 1;
+        break;
+      }
+    }
 
-    const watcherDir = "./watcher_session";
-    if (!watcherInitialized || !fs.existsSync(path.join(watcherDir, "creds.json"))) {
+    // Lock this slot exclusively until socket is completely closed
+    currentlyOnlineSlot = slot;
+    const sid = sids[slot];
+    botLabel = `Watcher #${slot + 1}/${sids.length}`;
+
+    console.log(`🌅 [${botLabel} Online] Exclusively checking ${activeSubs.length} channel(s)...`);
+
+    const watcherDir = `./watcher_session_${slot + 1}`;
+    if (!initializedWatchers.has(slot) || !fs.existsSync(path.join(watcherDir, "creds.json"))) {
       fs.mkdirSync(watcherDir, { recursive: true });
       await restoreCredsToFile(sid, path.join(watcherDir, "creds.json"));
-      watcherInitialized = true;
+      initializedWatchers.add(slot);
     }
 
     const detectedByJid = new Map();
-    const { sock, saveCreds } = await openWatcherSocket(watcherDir, detectedByJid, 2);
+    const { sock, saveCreds } = await openWatcherSocket(watcherDir, detectedByJid, botLabel, slot, 2);
     activeSock = sock;
 
     if (!sock) {
-      console.warn("⚠️ [Watcher] Could not connect WhatsApp socket this cycle.");
+      console.warn(`⚠️ [${botLabel}] Could not connect WhatsApp socket this turn.`);
       return;
     }
 
-    // Hold open 4.5s so any pushed channel messages flush in
-    await delay(4500);
+    await delay(4000);
 
     for (const sub of activeSubs) {
       try {
@@ -411,11 +449,16 @@ async function runWakeCheckSleepCycle() {
 
         if (!jid || !jid.endsWith("@newsletter")) continue;
 
-        if (!sub.followed) {
+        const followedSlots = Array.isArray(sub.followedSlots) ? sub.followedSlots : [];
+        if (!followedSlots.includes(slot)) {
           await sock.newsletterFollow(jid).catch(() => {});
-          await subsCol.updateOne({ _id: sub._id }, { $set: { followed: true } });
-          await delay(1200);
+          await subsCol.updateOne(
+            { _id: sub._id },
+            { $addToSet: { followedSlots: slot }, $set: { followed: true } }
+          );
+          await delay(1000);
         }
+
         if (typeof sock.subscribeNewsletterUpdates === "function") {
           await sock.subscribeNewsletterUpdates(jid).catch(() => {});
         }
@@ -425,10 +468,9 @@ async function runWakeCheckSleepCycle() {
           for (const id of detectedByJid.get(jid)) postIdSet.add(id);
         }
 
-        // ✅ Pass undefined for since/after so Baileys v7 returns the latest 10 posts instead of just 1
         if (typeof sock.newsletterFetchMessages === "function") {
           const rawMsgs = await sock.newsletterFetchMessages(jid, 10, undefined, undefined).catch((e) => {
-            console.warn(`⚠️ [Watcher] Fetch error for ${jid}:`, e.message);
+            console.warn(`⚠️ [${botLabel}] Fetch error for ${jid}:`, e.message);
             return null;
           });
           const fetchedIds = extractPostIdsFromBaileysResponse(rawMsgs);
@@ -437,7 +479,7 @@ async function runWakeCheckSleepCycle() {
 
         const sortedIds = Array.from(postIdSet).sort((a, b) => b - a);
         console.log(
-          `🔎 [Channel Scan] ${sub.channelName} -> posts=[${sortedIds.join(",")}], lastReacted=${sub.lastReactedPostId || 0}`
+          `🔎 [${botLabel}] ${sub.channelName} -> posts=[${sortedIds.join(",")}], lastReacted=${sub.lastReactedPostId || 0}`
         );
 
         if (sortedIds.length > 0) {
@@ -445,12 +487,9 @@ async function runWakeCheckSleepCycle() {
           const prevLast = Number(sub.lastReactedPostId || 0);
 
           if (prevLast === 0) {
-            // Set initial baseline so existing old posts are not spammed
             await subsCol.updateOne({ _id: sub._id }, { $set: { lastReactedPostId: newest } });
-            console.log(`📍 [Watcher] Baseline locked at post #${newest} for ${sub.channelName}`);
+            console.log(`📍 [${botLabel}] Baseline locked at post #${newest} for ${sub.channelName}`);
           } else if (newest > prevLast) {
-            // Fill any sequential post IDs between prevLast+1 and newest (up to 6 posts)
-            // Unique DB index ensures already-boosted posts are skipped automatically
             const candidateSet = new Set(sortedIds.filter((id) => id > prevLast));
             const startFill = Math.max(prevLast + 1, newest - 5);
             for (let id = startFill; id <= newest; id++) {
@@ -460,14 +499,14 @@ async function runWakeCheckSleepCycle() {
             const toBoost = Array.from(candidateSet).sort((a, b) => a - b).slice(-6);
             for (const pid of toBoost) {
               await boostDetectedPost(sub, pid);
-              await delay(1200);
+              await delay(1000);
             }
           }
         }
 
-        await delay(1000);
+        await delay(800);
       } catch (subErr) {
-        console.warn(`⚠️ [Watcher] Error checking ${sub.inviteCode}:`, subErr.message);
+        console.warn(`⚠️ [${botLabel}] Error checking ${sub.inviteCode}:`, subErr.message);
       }
     }
 
@@ -475,19 +514,22 @@ async function runWakeCheckSleepCycle() {
   } catch (err) {
     console.warn("⚠️ [Watcher Cycle] Error:", err.message);
   } finally {
+    // Fully close socket & wait briefly before releasing exclusive online lock
     if (activeSock) {
       try {
         activeSock.ev.removeAllListeners();
         activeSock.end(new Error("going to sleep"));
       } catch (_) {}
+      await delay(1000);
     }
+    if (currentlyOnlineSlot !== null) {
+      console.log(`😴 [${botLabel} Offline] Socket closed cleanly.`);
+    }
+    currentlyOnlineSlot = null;
     isCycleRunning = false;
   }
 }
 
-// ═════════════════════════════════════════════════════════════════
-//  POST /api/react/single — Instant Single Post Reaction Pack
-// ═════════════════════════════════════════════════════════════════
 router.post("/single", singleReactLimiter, async (req, res) => {
   try {
     const rawUrl = String(req.body?.url || "").trim();
@@ -526,9 +568,6 @@ router.post("/single", singleReactLimiter, async (req, res) => {
   }
 });
 
-// ═════════════════════════════════════════════════════════════════
-//  POST /api/react/weekly — Activate 7-Day Auto-React Subscription
-// ═════════════════════════════════════════════════════════════════
 router.post("/weekly", weeklySubLimiter, async (req, res) => {
   try {
     const rawUrl = String(req.body?.url || "").trim();
@@ -560,11 +599,10 @@ router.post("/weekly", weeklySubLimiter, async (req, res) => {
     const db = await getReactDb();
     const col = db.collection(WEEKLY_COLLECTION);
 
-    // Preserve existing baseline & JID if channel was already registered
     const existing = await col.findOne({ inviteCode });
     const preservedBaseline = existing?.lastReactedPostId || specificPostId || 0;
     const preservedJid = existing?.jid || `${inviteCode}@newsletter`;
-    const preservedFollowed = Boolean(existing?.followed);
+    const preservedSlots = Array.isArray(existing?.followedSlots) ? existing.followedSlots : [];
 
     const subDoc = {
       inviteCode,
@@ -572,7 +610,8 @@ router.post("/weekly", weeklySubLimiter, async (req, res) => {
       channelName,
       count,
       emojis,
-      followed: preservedFollowed,
+      followed: preservedSlots.length > 0,
+      followedSlots: preservedSlots,
       lastReactedPostId: preservedBaseline,
       active: true,
       updatedAt: now,
@@ -596,8 +635,10 @@ router.post("/weekly", weeklySubLimiter, async (req, res) => {
       }
     }
 
-    // Wake watcher after 2s to resolve JID & lock baseline if new
-    setTimeout(() => runWakeCheckSleepCycle().catch(() => {}), 2000);
+    // Only trigger immediate check if no bot is currently online
+    if (!isCycleRunning && currentlyOnlineSlot === null) {
+      setTimeout(() => runWakeCheckSleepCycle().catch(() => {}), 2000);
+    }
 
     return res.json({
       ok: true,
@@ -608,7 +649,7 @@ router.post("/weekly", weeklySubLimiter, async (req, res) => {
         channelName,
         count,
         emojis,
-        mode: "Random Wake/Sleep (2m - 6.5m)",
+        watcherBotsCount: getAliveWatcherCount(),
         expiresAt: expiresAt.toISOString(),
       },
     });
@@ -620,9 +661,6 @@ router.post("/weekly", weeklySubLimiter, async (req, res) => {
   }
 });
 
-// ═════════════════════════════════════════════════════════════════
-//  GET /api/react/weekly/:inviteCode — Check Subscription Status
-// ═════════════════════════════════════════════════════════════════
 router.get("/weekly/:inviteCode", async (req, res) => {
   try {
     const code = String(req.params.inviteCode || "").trim();
@@ -653,6 +691,7 @@ router.get("/weekly/:inviteCode", async (req, res) => {
         emojis: sub.emojis,
         lastReactedPostId: sub.lastReactedPostId || 0,
         reactedPostsCount: sub.reactedPostsCount || 0,
+        watcherBotsCount: getAliveWatcherCount(),
         expiresAt: sub.expiresAt,
       },
     });
@@ -662,26 +701,33 @@ router.get("/weekly/:inviteCode", async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════
-//  Recursive Random Timer Scheduler (Always < 7 Minutes)
+//  Sequential Chain Scheduler (Next Sleep Starts ONLY After Bot Sleeps)
 // ═════════════════════════════════════════════════════════════════
+let loopStarted = false;
 export function startWeeklyReactWorker() {
-  async function scheduleNextWake() {
-    const sleepMs = getRandomSleepMs();
-    const mins = (sleepMs / 60000).toFixed(1);
-    console.log(`💤 [Watcher Sleep] Next wake-up in ${mins} mins...`);
+  if (loopStarted) return;
+  loopStarted = true;
+
+  async function scheduleNextTurn() {
+    const n = getAliveWatcherCount();
+    const sleepMs = getScaledSleepMs();
+    const secs = Math.round(sleepMs / 1000);
+    const label = secs >= 60 ? `${(secs / 60).toFixed(1)} mins` : `${secs}s`;
+    console.log(`💤 [Pool Sleep | ${n} Bot(s)] Next single-bot turn in ${label}...`);
 
     setTimeout(async () => {
       await runWakeCheckSleepCycle();
-      scheduleNextWake();
+      scheduleNextTurn();
     }, sleepMs);
   }
 
   setTimeout(async () => {
     await runWakeCheckSleepCycle();
-    scheduleNextWake();
+    scheduleNextTurn();
   }, 8 * 1000);
 
-  console.log("🚀 Weekly Channel Auto-React Worker active (Random 2m–6.5m Wake/Sleep Mode)");
+  const count = getWatcherSessionIds().length;
+  console.log(`🚀 Weekly Channel Auto-React Worker active (${count} Bot(s) | Auto-Scaled | Strict 1-Bot Online)`);
 }
 
 export default router;
