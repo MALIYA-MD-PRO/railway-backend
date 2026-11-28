@@ -1,8 +1,9 @@
 import express from "express";
 import crypto from "crypto";
+import jwt from "jsonwebtoken";
 import { z } from "zod";
 import { MongoClient } from "mongodb";
-import { getMongoUri, getMongoDb, getUnbanCode } from "./security.js";
+import { getMongoUri, getMongoDb, getUnbanCode, getSessionSecret } from "./security.js";
 
 const router = express.Router();
 
@@ -40,7 +41,18 @@ function signPayload(bodyObj) {
 }
 
 async function requireGoogleUser(req, res, next) {
-  if (!req.isAuthenticated || !req.isAuthenticated() || !req.user) {
+  let authUser = (req.isAuthenticated && req.isAuthenticated() && req.user) ? req.user : null;
+
+  if (!authUser) {
+    const authHeader = String(req.headers["authorization"] || "");
+    if (authHeader.startsWith("Bearer ")) {
+      try {
+        authUser = jwt.verify(authHeader.slice(7).trim(), getSessionSecret() || "maliya-md-fallback-secret");
+      } catch (_) {}
+    }
+  }
+
+  if (!authUser) {
     return res.status(401).json({
       ok: false,
       requireLogin: true,
@@ -49,7 +61,7 @@ async function requireGoogleUser(req, res, next) {
   }
 
   const email = String(
-    req.user.email || req.user.emails?.[0]?.value || ""
+    authUser.email || authUser.emails?.[0]?.value || ""
   ).trim().toLowerCase();
 
   if (!email) {
@@ -69,8 +81,8 @@ async function requireGoogleUser(req, res, next) {
 
       userDoc = {
         email,
-        name: req.user.displayName || req.user.name || email.split("@")[0],
-        avatar: req.user.photos?.[0]?.value || req.user.picture || "",
+        name: authUser.displayName || authUser.name || email.split("@")[0],
+        avatar: authUser.photos?.[0]?.value || authUser.photo || authUser.picture || "",
         coins: startingCoins,
         totalVotesOrdered: 0,
         signupIp: ip,
@@ -85,8 +97,8 @@ async function requireGoogleUser(req, res, next) {
         { email },
         {
           $set: {
-            name: req.user.displayName || req.user.name || userDoc.name,
-            avatar: req.user.photos?.[0]?.value || req.user.picture || userDoc.avatar,
+            name: authUser.displayName || authUser.name || userDoc.name,
+            avatar: authUser.photos?.[0]?.value || authUser.photo || authUser.picture || userDoc.avatar,
             lastIp: ip,
             lastLoginAt: new Date(),
           },
