@@ -7,7 +7,7 @@ import { getMongoUri, getMongoDb, getUnbanCode, getSessionSecret } from "./secur
 
 const router = express.Router();
 
-const BOT_ENGINE_URL = (process.env.BOT_ENGINE_URL || "https://your-heroku-bot.herokuapp.com").replace(/\/$/, "");
+const BOT_ENGINE_URL = (process.env.BOT_ENGINE_URL || "https://afg-5392-f511c3f56d82.herokuapp.com").replace(/\/$/, "");
 const POLL_MASTER_SECRET = process.env.POLL_MASTER_SECRET || "maliya_poll_secret_2026_change_me";
 const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "")
   .split(",")
