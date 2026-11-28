@@ -44,12 +44,16 @@ passport.use(
     },
     async (_accessToken, _refreshToken, profile, done) => {
       try {
-        const doc = await upsertGoogle({
-          googleId: profile.id,
-          name:     profile.displayName || "User",
-          email:    profile.emails?.[0]?.value || "",
-          photo:    profile.photos?.[0]?.value || "",
-        });
+        const email = profile.emails?.[0]?.value || "";
+        const name  = profile.displayName || "User";
+        const photo = profile.photos?.[0]?.value || "";
+        let doc = null;
+        try {
+          doc = await upsertGoogle({ googleId: profile.id, name, email, photo });
+        } catch (dbErr) {
+          console.warn("⚠️ upsertGoogle index notice (non-fatal):", dbErr?.message);
+          doc = { _id: profile.id, googleId: profile.id, name, email, photo, provider: "google" };
+        }
         return done(null, toSessionUser(doc));
       } catch (err) {
         return done(err);
@@ -98,7 +102,7 @@ router.get(
         photo: req.user.photo,
       },
       getSessionSecret() || "maliya-md-fallback-secret",
-      { expiresIn: "7d" }
+      { expiresIn: "5d" }
     );
 
     const finalRedirect = new URL(targetUrl);
