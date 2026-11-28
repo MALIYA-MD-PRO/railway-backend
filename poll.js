@@ -14,13 +14,13 @@ const BOT_ENGINE_URL = (
   process.env.BOT_ENGINE_URL || "https://afg-5392-f511c3f56d82.herokuapp.com"
 ).replace(/\/$/, "");
 const POLL_MASTER_SECRET =
-  process.env.POLL_MASTER_SECRET || "";
+  process.env.POLL_MASTER_SECRET || "maliya_poll_secret_2026_change_me";
 const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "")
   .split(",")
   .map((e) => e.trim().toLowerCase())
   .filter(Boolean);
 
-const COST_PER_VOTE = 25;
+const COST_PER_PACK = 25;
 const WELCOME_BONUS_COINS = 50;
 const ENGINE_TIMEOUT_MS = 45000;
 
@@ -59,7 +59,10 @@ function signPayload(bodyObj) {
   return { ts, sig };
 }
 
-async function fetchBotEngine(endpointPath, { method = "GET", body = null, timeoutMs = ENGINE_TIMEOUT_MS } = {}) {
+async function fetchBotEngine(
+  endpointPath,
+  { method = "GET", body = null, timeoutMs = ENGINE_TIMEOUT_MS } = {}
+) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -92,12 +95,16 @@ async function fetchBotEngine(endpointPath, { method = "GET", body = null, timeo
       try {
         parsed = JSON.parse(rawText);
       } catch {
+        const friendlyError =
+          res.status === 503
+            ? "Bot engine is currently unavailable (Heroku 503). Check Heroku dyno status/quota and try again."
+            : `Bot engine returned non-JSON response (${res.status}).`;
         return {
           ok: false,
           status: res.status >= 400 ? res.status : 502,
           data: {
             ok: false,
-            error: `Bot engine returned non-JSON response (${res.status}): ${rawText.slice(0, 120)}`,
+            error: friendlyError,
           },
         };
       }
@@ -115,7 +122,8 @@ async function fetchBotEngine(endpointPath, { method = "GET", body = null, timeo
         status: 504,
         data: {
           ok: false,
-          error: "Bot engine timed out (possibly waking up from sleep). Please try again in a few seconds.",
+          error:
+            "Bot engine timed out (possibly waking up from sleep). Please try again in a few seconds.",
         },
       };
     }
@@ -278,7 +286,7 @@ router.get("/me", requireGoogleUser, async (req, res) => {
     return res.json({
       ok: true,
       isAdmin: req.isPollAdmin,
-      costPerVote: COST_PER_VOTE,
+      costPerPack: COST_PER_PACK,
       user: {
         email: req.pollUser.email,
         name: req.pollUser.name,
@@ -317,10 +325,11 @@ const voteSchema = z.object({
   pollUrl: z
     .string()
     .regex(/^https:\/\/(www\.)?whatsapp\.com\/channel\/[A-Za-z0-9_-]+\/\d+/),
-  optionIndex: z.coerce.number().int().min(0).max(11),
-  optionName: z.string().max(120).optional().default("Selected Option"),
+  optionIndex: z.coerce.number().int().min(0).max(11).optional(),
+  optionIndices: z.array(z.coerce.number().int().min(0).max(11)).min(1).max(12).optional(),
+  optionName: z.string().max(300).optional().default("Selected Option"),
   channelName: z.string().max(120).optional().default("WhatsApp Channel"),
-  votesCount: z.coerce.number().int().min(1).max(100),
+  votesCount: z.coerce.number().int().min(1).max(500).optional(),
 });
 
 router.post("/vote", requireGoogleUser, async (req, res) => {
@@ -329,9 +338,19 @@ router.post("/vote", requireGoogleUser, async (req, res) => {
     return res.status(400).json({ ok: false, error: "Invalid poll parameters." });
   }
 
-  const { pollUrl, optionIndex, optionName, channelName, votesCount } = parsed.data;
+  const { pollUrl, optionIndex, optionIndices, optionName, channelName, votesCount } = parsed.data;
+  const cleanIndices = Array.isArray(optionIndices) && optionIndices.length > 0
+    ? [...new Set(optionIndices)]
+    : optionIndex !== undefined
+      ? [optionIndex]
+      : [];
+
+  if (!cleanIndices.length) {
+    return res.status(400).json({ ok: false, error: "Please select at least 1 poll option." });
+  }
+
   const cleanUrl = pollUrl.trim().split("?")[0];
-  const totalCost = votesCount * COST_PER_VOTE;
+  const totalCost = COST_PER_PACK; // Flat 25 coins for the full vote pack!
   const email = req.pollUser.email;
 
   let db;
@@ -350,7 +369,7 @@ router.post("/vote", requireGoogleUser, async (req, res) => {
   const deductResult = await usersCol.findOneAndUpdate(
     { email, coins: { $gte: totalCost }, isBanned: { $ne: true } },
     {
-      $inc: { coins: -totalCost, totalVotesOrdered: votesCount },
+      $inc: { coins: -totalCost },
       $set: { updatedAt: new Date() },
     },
     { returnDocument: "after" }
@@ -360,14 +379,15 @@ router.post("/vote", requireGoogleUser, async (req, res) => {
   if (!updatedUser || typeof updatedUser.coins !== "number") {
     return res.status(402).json({
       ok: false,
-      error: `Insufficient coins! Need ${totalCost} coins (${votesCount} × ${COST_PER_VOTE}), you have ${req.pollUser.coins} coins.`,
+      error: `Insufficient coins! Need ${totalCost} coins for a Full Poll Pack, you have ${req.pollUser.coins} coins.`,
     });
   }
 
   const payload = {
     pollUrl: cleanUrl,
-    optionIndex,
-    requestedVotes: votesCount,
+    optionIndex: cleanIndices[0],
+    optionIndices: cleanIndices,
+    ...(votesCount ? { requestedVotes: votesCount } : {}),
     userEmail: email,
   };
 
@@ -380,7 +400,7 @@ router.post("/vote", requireGoogleUser, async (req, res) => {
     await usersCol
       .updateOne(
         { email },
-        { $inc: { coins: totalCost, totalVotesOrdered: -votesCount } }
+        { $inc: { coins: totalCost } }
       )
       .catch(() => {});
 
@@ -391,6 +411,12 @@ router.post("/vote", requireGoogleUser, async (req, res) => {
   }
 
   const data = engineResult.data || {};
+  const deliveredCount = Number(data.plannedVotes || 1);
+
+  await usersCol
+    .updateOne({ email }, { $inc: { totalVotesOrdered: deliveredCount } })
+    .catch(() => {});
+
   await ordersCol
     .insertOne({
       jobId: data.jobId,
@@ -398,9 +424,10 @@ router.post("/vote", requireGoogleUser, async (req, res) => {
       userName: req.pollUser.name,
       pollUrl: cleanUrl,
       channelName,
-      optionIndex,
+      optionIndex: cleanIndices[0],
+      optionIndices: cleanIndices,
       optionName,
-      votesCount: data.plannedVotes,
+      votesCount: deliveredCount,
       coinsSpent: totalCost,
       status: "running",
       createdAt: new Date(),
@@ -410,9 +437,9 @@ router.post("/vote", requireGoogleUser, async (req, res) => {
   return res.json({
     ok: true,
     jobId: data.jobId,
-    plannedVotes: data.plannedVotes,
+    plannedVotes: deliveredCount,
     remainingCoins: updatedUser.coins,
-    estimatedMinutes: data.estimatedMinutes || 4,
+    estimatedSeconds: data.estimatedSeconds || Math.max(3, deliveredCount * 3),
   });
 });
 
@@ -422,9 +449,10 @@ router.get("/status/:jobId", requireGoogleUser, async (req, res) => {
     return res.status(400).json({ ok: false, error: "Invalid job ID." });
   }
 
-  const engineResult = await fetchBotEngine(`/api/internal/poll-status/${encodeURIComponent(jobId)}`, {
-    method: "GET",
-  });
+  const engineResult = await fetchBotEngine(
+    `/api/internal/poll-status/${encodeURIComponent(jobId)}`,
+    { method: "GET" }
+  );
 
   return res.status(engineResult.status).json(engineResult.data);
 });
