@@ -379,7 +379,7 @@ async function openWatcherSocket(watcherDir, detectedByJid, botLabel, slotIndex,
 //  STRICT SINGLE-ACTIVE-BOT TURN CYCLE (100% Account-Safe)
 // ═════════════════════════════════════════════════════════════════
 async function runWakeCheckSleepCycle() {
-  if (isCycleRunning && Date.now() - cycleStartedAt > 90 * 1000) {
+  if (isCycleRunning && Date.now() - cycleStartedAt > 120 * 1000) {
     console.warn("⚠️ [Watchdog] Releasing stale cycle lock...");
     isCycleRunning = false;
     currentlyOnlineSlot = null;
@@ -503,15 +503,23 @@ async function runWakeCheckSleepCycle() {
             console.log(`📍 [${botLabel}] Baseline locked at post #${newest} for ${sub.channelName}`);
           } else if (newest > prevLast) {
             const candidateSet = new Set(sortedIds.filter((id) => id > prevLast));
-            const startFill = Math.max(prevLast + 1, newest - 5);
+            const startFill = Math.max(prevLast + 1, newest - 9); // Up to 10 consecutive posts
             for (let id = startFill; id <= newest; id++) {
               candidateSet.add(id);
             }
 
-            const toBoost = Array.from(candidateSet).sort((a, b) => a - b).slice(-6);
-            for (const pid of toBoost) {
-              await boostDetectedPost(sub, pid);
-              await delay(1000);
+            const toBoost = Array.from(candidateSet).sort((a, b) => a - b).slice(0, 10);
+            for (let i = 0; i < toBoost.length; i++) {
+              const pid = toBoost[i];
+              const ok = await boostDetectedPost(sub, pid);
+              if (!ok) {
+                // Stop here so next cycle retries from this exact post without skipping
+                break;
+              }
+              // Wait 8 seconds between consecutive posts so upstream API never rate-limits
+              if (i < toBoost.length - 1) {
+                await delay(8000);
+              }
             }
           }
         }
