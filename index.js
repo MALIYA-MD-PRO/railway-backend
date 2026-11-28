@@ -38,6 +38,7 @@ import ytRouter         from "./yt.js";
 import authRouter, { passport } from "./auth.js";
 import apiKeysRouter    from "./api-keys.js";
 import reactRouter, { startWeeklyReactWorker } from "./react.js";
+import pollRouter       from "./poll.js";
 import { getSessionId, setSessionId } from "./session-store.js";
 
 const app        = express();
@@ -85,7 +86,7 @@ app.use(cors({
     }
   },
   methods:        ["GET", "POST", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "x-api-key", "x-settings-token"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-api-key", "x-settings-token", "x-admin-pin"],
   credentials:    true,
 }));
 
@@ -228,6 +229,8 @@ app.get(["/pair", "/pair.html"], (req, res, next) => {
 
 app.get(["/settings", "/settings.html"], (_req, res) => sendHtmlPage(res, "settings.html"));
 app.get(["/react", "/react.html"], (_req, res) => sendHtmlPage(res, "react.html"));
+app.get(["/profile", "/profile.html"], (_req, res) => sendHtmlPage(res, "profile.html"));
+app.get(["/admin-poll", "/admin-poll.html"], (_req, res) => sendHtmlPage(res, "admin-poll.html"));
 
 // ─────────────────────────────────────────────────────────────────
 //  Unban verification endpoint
@@ -320,6 +323,7 @@ app.post("/session-id/clear", requireJWT, (_req, res) => {
 app.use("/auth",      authRouter);
 app.use("/api-keys",  apiKeysRouter);
 app.use("/api/react", reactRouter);
+app.use("/api/poll",  pollRouter);
 app.use("/pair",      generateLimiter, pairRouter);
 app.use("/qr",        generateLimiter, qrRouter);
 app.use("/api/chat",  chatRouter);
