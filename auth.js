@@ -9,14 +9,18 @@
 // ═══════════════════════════════════════════════════════════════
 
 import express            from "express";
+import jwt                from "jsonwebtoken";
 import { createRequire }  from "module";
-import { getGoogleClientId, getGoogleClientSecret } from "./security.js";
+import { getGoogleClientId, getGoogleClientSecret, getSessionSecret } from "./security.js";
 import { findByEmail, findByGoogleId, createLocal, upsertGoogle } from "./models/User.js";
 
 const require  = createRequire(import.meta.url);
 const passport = require("passport");
 const bcrypt   = require("bcryptjs");
 const { Strategy: GoogleStrategy } = require("passport-google-oauth20");
+
+const BACKEND_PUBLIC_URL  = (process.env.BACKEND_URL || "https://railway-backend-production-0b48.up.railway.app").replace(/\/$/, "");
+const FRONTEND_PUBLIC_URL = (process.env.FRONTEND_URL || "https://maliya-md.vercel.app").replace(/\/$/, "");
 
 // ─── Helper — safe user object for session ────────────────────
 function toSessionUser(doc) {
@@ -35,7 +39,7 @@ passport.use(
     {
       clientID:     getGoogleClientId(),
       clientSecret: getGoogleClientSecret(),
-      callbackURL:  "/auth/google/callback",
+      callbackURL:  `${BACKEND_PUBLIC_URL}/auth/google/callback`,
       proxy:        true,
     },
     async (_accessToken, _refreshToken, profile, done) => {
@@ -63,12 +67,44 @@ export { passport };
 const router = express.Router();
 
 // ── Google OAuth ─────────────────────────────────────────────
-router.get("/google", passport.authenticate("google", { scope: ["profile", "email"] }));
+router.get("/google", (req, res, next) => {
+  const redirectTarget = String(req.query.redirect || `${FRONTEND_PUBLIC_URL}/react.html?tab=poll`);
+  const state = Buffer.from(redirectTarget).toString("base64url");
+  passport.authenticate("google", {
+    scope: ["profile", "email"],
+    state,
+  })(req, res, next);
+});
 
 router.get(
   "/google/callback",
-  passport.authenticate("google", { failureRedirect: "/?auth=failed" }),
-  (_req, res) => res.redirect("/?auth=ok")
+  passport.authenticate("google", { failureRedirect: `${FRONTEND_PUBLIC_URL}/react.html?tab=poll&auth=failed` }),
+  (req, res) => {
+    let targetUrl = `${FRONTEND_PUBLIC_URL}/react.html?tab=poll`;
+    try {
+      if (req.query.state) {
+        const decoded = Buffer.from(String(req.query.state), "base64url").toString("utf8");
+        if (decoded.startsWith("http://") || decoded.startsWith("https://")) {
+          targetUrl = decoded;
+        }
+      }
+    } catch (_) {}
+
+    const authToken = jwt.sign(
+      {
+        id:    req.user.id,
+        email: req.user.email,
+        name:  req.user.name,
+        photo: req.user.photo,
+      },
+      getSessionSecret() || "maliya-md-fallback-secret",
+      { expiresIn: "7d" }
+    );
+
+    const finalRedirect = new URL(targetUrl);
+    finalRedirect.searchParams.set("auth_token", authToken);
+    return res.redirect(finalRedirect.toString());
+  }
 );
 
 // ── POST /auth/register ── create local account ───────────────
@@ -135,7 +171,6 @@ router.post("/login", async (req, res) => {
 router.get("/user", (req, res) => {
   res.json({ user: req.user || null });
 });
-// api-dashboard.html calls /auth/me — keep both routes in sync
 router.get("/me", (req, res) => {
   res.json({ user: req.user || null });
 });
