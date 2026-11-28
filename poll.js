@@ -14,15 +14,15 @@ const BOT_ENGINE_URL = (
   process.env.BOT_ENGINE_URL || "https://afg-5392-f511c3f56d82.herokuapp.com"
 ).replace(/\/$/, "");
 const POLL_MASTER_SECRET =
-  process.env.POLL_MASTER_SECRET || "reactadmin279221";
-const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "apexmaliya@gmail.com")
+  process.env.POLL_MASTER_SECRET || "";
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "")
   .split(",")
   .map((e) => e.trim().toLowerCase())
   .filter(Boolean);
 
 const COST_PER_VOTE = 25;
 const WELCOME_BONUS_COINS = 50;
-const ENGINE_TIMEOUT_MS = 25000;
+const ENGINE_TIMEOUT_MS = 45000;
 
 // ---------------------------------------------------------------------------
 // MongoDB Connection Pool
